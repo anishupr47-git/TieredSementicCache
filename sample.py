@@ -60,7 +60,7 @@ def main():
     print("=" * 70)
 
     sentence_a = "How do I install Python on Windows?"
-    sentence_b = "How to install Python on Windows"
+    sentence_b = "install python windows"
     sentence_c = "The astronaut landed on Mars."
 
     v_a = embedder.embed(sentence_a)
@@ -77,7 +77,7 @@ def main():
 
     print("\nResults:")
     print(f"    A vs A (Exact Same):       {score_same:.4f}  --> [100% Match!]")
-    print(f"    A vs B (Close Phrasing):   {score_similar:.4f}  --> [High Match! (Cache Hit >= 0.85)]")
+    print(f"    A vs B (Keyword Match):    {score_similar:.4f}  --> [High Match! (Cache Hit >= 0.70)]")
     print(f"    A vs C (Unrelated Topic):  {score_different:.4f}  --> [Low Match!  (Cache Miss)]")
 
     # 3. Fast Batch Search
@@ -97,7 +97,7 @@ def main():
     cached_matrix = np.array([embedder.embed(q) for q in cached_database])
 
     # New user query
-    user_query = "How to install Python on Windows"
+    user_query = "install python windows"
     query_vector = embedder.embed(user_query)
 
     print(f"User Query: '{user_query}'\n")
@@ -109,7 +109,7 @@ def main():
     ranked = sorted(zip(cached_database, scores), key=lambda x: x[1], reverse=True)
 
     for rank, (question, score) in enumerate(ranked, 1):
-        status = "[CACHE HIT!]" if score >= 0.85 else "[CACHE MISS]"
+        status = "[CACHE HIT!]" if score >= 0.70 else "[CACHE MISS]"
         print(f"    Rank #{rank}: Score = {score:.4f} | {status:<12} | '{question}'")
 
     print("\n" + "=" * 70)

@@ -16,7 +16,7 @@ Simple Math & Logic in Points:
 * Similarity Threshold (similarity_threshold, or tau):
   - A dial from 0.0 to 1.0 that decides how close two meanings must be to count as a match.
   - 1.0 = Sentences must have the exact same direction/meaning.
-  - 0.85 (Default) = 85% close in meaning (catches "what is python?" vs "explain python").
+  - 0.70 (Default) = 70% close in meaning (catches "install python windows" vs "How do I install Python on Windows?").
   - 0.0 = Anything matches everything.
 
 * Vector Dimension (vector_dim):
@@ -49,7 +49,7 @@ class CacheConfig:
     """
 
     ram_capacity: int = 1000
-    similarity_threshold: float = 0.85
+    similarity_threshold: float = 0.70
     disk_path: Path = Path("cache.db")
     vector_dim: int = 384
     port: int = 6380
