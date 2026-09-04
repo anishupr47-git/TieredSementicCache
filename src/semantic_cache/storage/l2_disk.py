@@ -78,6 +78,10 @@ class L2DiskCache:
         """Total number of items saved in the filing cabinet."""
         return self._count
 
+    def __contains__(self, key: str) -> bool:
+        """Check if key exists in L2 index in O(1) time."""
+        return key in self._index
+
     def _build_index(self) -> None:
         """Scan the disk log once at startup to index all saved items."""
         self._file.seek(0, 2)

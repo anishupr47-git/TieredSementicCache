@@ -73,6 +73,10 @@ class L1RAMCache:
         """Current number of items on the desk."""
         return len(self._records)
 
+    def __contains__(self, key: str) -> bool:
+        """Check if key exists in L1 in O(1) time."""
+        return key in self._records
+
     def is_full(self) -> bool:
         """True if desk has reached maximum capacity."""
         return len(self._records) >= self.capacity
