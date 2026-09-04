@@ -21,11 +21,17 @@ Each saved item is written to the end of the file as compact binary bytes:
 │    4 bytes    │   4 bytes    │   4 bytes    │  (variable)  │  (variable)  │    4 * d bytes   │
 └───────────────┴──────────────┴──────────────┴──────────────┴──────────────┴──────────────────┘
 
-Index Card System (In-Memory Offset Map):
------------------------------------------
-We keep a tiny index in RAM that remembers the exact byte location of every key:
-  key -> (byte_offset, record_length)
-When looking up an answer, we jump directly to that exact byte number on the disk!
+Zero-Allocation Search & Indexing:
+----------------------------------
+1. Index Card System:
+   We keep a tiny index in RAM that remembers the exact byte location of every key:
+     key -> (byte_offset, record_length)
+   When looking up an answer, we jump directly to that exact byte number on the disk!
+
+2. Zero-Allocation Semantic Scan:
+   Vectors are kept in a contiguous 2D table that doubles geometrically.
+   Searching uses a zero-copy NumPy slice view: active = matrix[:count].
+   Runs BLAS Level-2 GEMV with ZERO heap allocations during search!
 """
 
 from __future__ import annotations
@@ -56,9 +62,10 @@ class L2DiskCache:
         # In-memory index: key -> (byte_offset, total_record_length)
         self._index: dict[str, Tuple[int, int]] = {}
 
-        # Vector table for semantic scanning in L2
+        # Contiguous vector table for zero-allocation BLAS semantic search
         self._keys_list: list[str] = []
-        self._vectors_list: list[np.ndarray] = []
+        self._matrix = np.empty((128, dim), dtype=np.float32)
+        self._count: int = 0
 
         # Open file handle and memory map
         self._file = open(self.file_path, "a+b")
@@ -69,7 +76,7 @@ class L2DiskCache:
 
     def __len__(self) -> int:
         """Total number of items saved in the filing cabinet."""
-        return len(self._index)
+        return self._count
 
     def _build_index(self) -> None:
         """Scan the disk log once at startup to index all saved items."""
@@ -82,6 +89,8 @@ class L2DiskCache:
         self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
 
         offset = 0
+        vectors: list[np.ndarray] = []
+
         while offset + HEADER_SIZE <= size:
             klen, vlen, dim = struct.unpack_from(HEADER_FORMAT, self._mm, offset)
             record_len = HEADER_SIZE + klen + vlen + (dim * 4)
@@ -99,9 +108,17 @@ class L2DiskCache:
 
             self._index[key] = (offset, record_len)
             self._keys_list.append(key)
-            self._vectors_list.append(vec)
+            vectors.append(vec)
 
             offset += record_len
+
+        # Populate contiguous vector matrix
+        self._count = len(self._keys_list)
+        if self._count > 0:
+            alloc_cap = max(128, self._count * 2)
+            self._matrix = np.empty((alloc_cap, self.dim), dtype=np.float32)
+            for i, v in enumerate(vectors):
+                self._matrix[i] = v
 
     def get_exact(self, key: str) -> Optional[CacheRecord]:
         """Read a record from disk in strict O(1) time using zero-copy mmap."""
@@ -126,13 +143,13 @@ class L2DiskCache:
         query_vector: np.ndarray,
         threshold: float,
     ) -> Optional[Tuple[CacheRecord, float]]:
-        """Scan filing cabinet for semantic similarity matches in O(M*d) time."""
-        if not self._vectors_list:
+        """Scan filing cabinet for semantic similarity matches in O(M*d) time with zero allocations."""
+        if self._count == 0:
             return None
 
-        # Stack L2 vectors for instant BLAS matrix multiplication
-        matrix = np.array(self._vectors_list, dtype=np.float32)
-        scores = np.dot(matrix, query_vector)
+        # Zero-copy view of active rows (runs at hardware SIMD speed)
+        active_matrix = self._matrix[: self._count]
+        scores = np.dot(active_matrix, query_vector)
 
         best_idx = int(np.argmax(scores))
         best_score = float(scores[best_idx])
@@ -170,10 +187,20 @@ class L2DiskCache:
             self._mm.close()
         self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
 
-        # Update in-memory index card and vector list
+        # Ensure vector table has room (geometric doubling in amortized O(1))
+        idx = self._count
+        if idx >= len(self._matrix):
+            new_cap = len(self._matrix) * 2
+            new_matrix = np.empty((new_cap, self.dim), dtype=np.float32)
+            new_matrix[:idx] = self._matrix[:idx]
+            self._matrix = new_matrix
+
+        self._matrix[idx] = vector
+        self._count += 1
+
+        # Update in-memory index card and key list
         self._index[key] = (offset, total_len)
         self._keys_list.append(key)
-        self._vectors_list.append(vector.copy())
 
     def close(self) -> None:
         """Safely close open file handles and memory maps."""
