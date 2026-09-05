@@ -154,6 +154,25 @@ class L1RAMCache:
 
         return evicted
 
+    def delete(self, key: str) -> bool:
+        """Remove an item from L1 RAM in strict O(1) time.
+
+        Returns True if item was present and deleted, False otherwise.
+        """
+        if key not in self._records:
+            return False
+
+        self._remove_from_matrix(key)
+        del self._records[key]
+        return True
+
+    def clear(self) -> None:
+        """Clear all records and vector matrices in L1 RAM."""
+        self._records.clear()
+        self._matrix_keys.clear()
+        self._key_to_slot.clear()
+        self._matrix.fill(0.0)
+
     def _remove_from_matrix(self, key: str) -> None:
         """Remove an item's vector using O(1) slot swap (swap with last element)."""
         slot = self._key_to_slot.pop(key)

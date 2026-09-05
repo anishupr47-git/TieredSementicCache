@@ -29,6 +29,10 @@ import asyncio
 from typing import Optional, Sequence, Union
 
 
+MAX_ARGS = 1024
+MAX_BULK_LEN = 64 * 1024 * 1024  # 64 MB max payload
+
+
 class RESPSerializer:
     """Encodes Python data into standard Redis Serialization Protocol bytes."""
 
@@ -47,17 +51,19 @@ class RESPSerializer:
     @staticmethod
     def simple_string(text: str) -> bytes:
         """Encode a short one-line status string (+text)."""
-        return f"+{text}\r\n".encode("utf-8")
+        clean = text.replace("\r", " ").replace("\n", " ")
+        return f"+{clean}\r\n".encode("utf-8")
 
     @staticmethod
     def error(message: str) -> bytes:
         """Encode an error message (-ERR message)."""
-        return f"-ERR {message}\r\n".encode("utf-8")
+        clean = message.replace("\r", " ").replace("\n", " ")
+        return f"-ERR {clean}\r\n".encode("utf-8")
 
     @staticmethod
     def integer(value: int) -> bytes:
         """Encode a whole number (:number)."""
-        return f":{value}\r\n".encode("utf-8")
+        return f":{int(value)}\r\n".encode("utf-8")
 
     @staticmethod
     def bulk_string(value: Optional[Union[str, bytes]]) -> bytes:
@@ -87,44 +93,48 @@ class RESPParser:
 
         Returns:
             List of string arguments (e.g. ['SEMANTIC.GET', 'my query']),
-            or None if client disconnected.
+            or None if client disconnected or invalid payload.
         """
-        while True:
-            line = await reader.readline()
-            if not line:
-                return None  # Client disconnected
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    return None  # Client disconnected
 
-            # Strip trailing CRLF or LF
-            clean = line.rstrip(b"\r\n")
-            if not clean:
-                continue  # Ignore empty newline heartbeats
-            break
+                # Strip trailing CRLF or LF
+                clean = line.rstrip(b"\r\n")
+                if not clean:
+                    continue  # Ignore empty newline heartbeats
+                break
 
-        # 1. Handle standard RESP Array (*<count>\r\n)
-        if clean.startswith(b"*"):
-            try:
+            # 1. Handle standard RESP Array (*<count>\r\n)
+            if clean.startswith(b"*"):
                 count = int(clean[1:])
-            except ValueError:
-                return None
-
-            args: list[str] = []
-            for _ in range(count):
-                header = await reader.readline()
-                if not header or not header.startswith(b"$"):
+                if count <= 0 or count > MAX_ARGS:
                     return None
 
-                try:
+                args: list[str] = []
+                for _ in range(count):
+                    header = await reader.readline()
+                    if not header or not header.startswith(b"$"):
+                        return None
+
                     str_len = int(header[1:].rstrip(b"\r\n"))
-                except ValueError:
-                    return None
+                    if str_len < 0 or str_len > MAX_BULK_LEN:
+                        return None
 
-                # Read exact data bytes + 2 bytes for \r\n
-                payload = await reader.readexactly(str_len + 2)
-                arg_bytes = payload[:-2]  # slice off \r\n
-                args.append(arg_bytes.decode("utf-8", errors="replace"))
+                    # Read exact data bytes + 2 bytes for \r\n
+                    payload = await reader.readexactly(str_len + 2)
+                    if payload[-2:] != b"\r\n":
+                        return None
+                    arg_bytes = payload[:-2]  # slice off \r\n
+                    args.append(arg_bytes.decode("utf-8", errors="replace"))
 
-            return args
+                return args
 
-        # 2. Handle plain text inline command (e.g. "PING" or "STATS")
-        parts = clean.decode("utf-8", errors="replace").split()
-        return parts if parts else None
+            # 2. Handle plain text inline command (e.g. "PING" or "STATS")
+            parts = clean.decode("utf-8", errors="replace").split()
+            return parts if parts else None
+
+        except (asyncio.IncompleteReadError, ValueError):
+            return None

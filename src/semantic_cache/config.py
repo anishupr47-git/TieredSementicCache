@@ -57,28 +57,28 @@ class CacheConfig:
 
     def __post_init__(self) -> None:
         """Simple checks to catch any mistake before starting the cache."""
-        # 1. Check RAM capacity is positive
-        if not isinstance(self.ram_capacity, int) or self.ram_capacity <= 0:
+        # 1. Check RAM capacity is positive (and not boolean)
+        if type(self.ram_capacity) is not int or self.ram_capacity <= 0:
             raise ValueError(
-                f"ram_capacity must be a positive number greater than 0, got {self.ram_capacity}"
+                f"ram_capacity must be a positive integer greater than 0, got {self.ram_capacity}"
             )
 
         # 2. Check similarity dial is between 0.0 (0%) and 1.0 (100%)
-        if not isinstance(self.similarity_threshold, (int, float)) or not (
+        if not isinstance(self.similarity_threshold, (int, float)) or isinstance(self.similarity_threshold, bool) or not (
             0.0 <= float(self.similarity_threshold) <= 1.0
         ):
             raise ValueError(
                 f"similarity_threshold must be between 0.0 and 1.0, got {self.similarity_threshold}"
             )
 
-        # 3. Check vector size is positive
-        if not isinstance(self.vector_dim, int) or self.vector_dim <= 0:
+        # 3. Check vector size is positive (and not boolean)
+        if type(self.vector_dim) is not int or self.vector_dim <= 0:
             raise ValueError(
-                f"vector_dim must be a positive number greater than 0, got {self.vector_dim}"
+                f"vector_dim must be a positive integer greater than 0, got {self.vector_dim}"
             )
 
-        # 4. Check network port is valid
-        if not isinstance(self.port, int) or not (1 <= self.port <= 65535):
+        # 4. Check network port is valid (and not boolean)
+        if type(self.port) is not int or not (1 <= self.port <= 65535):
             raise ValueError(
                 f"port must be a valid network port between 1 and 65535, got {self.port}"
             )

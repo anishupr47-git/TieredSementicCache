@@ -61,6 +61,7 @@ class L2DiskCache:
 
         # In-memory index: key -> (byte_offset, total_record_length)
         self._index: dict[str, Tuple[int, int]] = {}
+        self._key_to_slot: dict[str, int] = {}
 
         # Contiguous vector table for zero-allocation BLAS semantic search
         self._keys_list: list[str] = []
@@ -75,7 +76,7 @@ class L2DiskCache:
         self._build_index()
 
     def __len__(self) -> int:
-        """Total number of items saved in the filing cabinet."""
+        """Total number of unique items saved in the filing cabinet."""
         return self._count
 
     def __contains__(self, key: str) -> bool:
@@ -83,7 +84,7 @@ class L2DiskCache:
         return key in self._index
 
     def _build_index(self) -> None:
-        """Scan the disk log once at startup to index all saved items."""
+        """Scan the disk log once at startup to index all saved items, deduplicating superseded entries."""
         self._file.seek(0, 2)
         size = self._file.tell()
         if size == 0:
@@ -93,7 +94,8 @@ class L2DiskCache:
         self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
 
         offset = 0
-        vectors: list[np.ndarray] = []
+        # Deduplicated map: key -> (offset, record_len, vector)
+        deduped: dict[str, Tuple[int, int, np.ndarray]] = {}
 
         while offset + HEADER_SIZE <= size:
             klen, vlen, dim = struct.unpack_from(HEADER_FORMAT, self._mm, offset)
@@ -103,38 +105,45 @@ class L2DiskCache:
                 break  # Incomplete record at end of file
 
             # Read key text
-            key_bytes = bytes(self._mm[offset + HEADER_SIZE : offset + HEADER_SIZE + klen])
+            key_bytes = self._mm[offset + HEADER_SIZE : offset + HEADER_SIZE + klen]
             key = key_bytes.decode("utf-8")
 
             # Read vector arrow
             vec_offset = offset + HEADER_SIZE + klen + vlen
             vec = np.frombuffer(self._mm, dtype=np.float32, count=dim, offset=vec_offset).copy()
 
-            self._index[key] = (offset, record_len)
-            self._keys_list.append(key)
-            vectors.append(vec)
-
+            # The latest record in the log supersedes older records for the same key
+            deduped[key] = (offset, record_len, vec)
             offset += record_len
 
-        # Populate contiguous vector matrix
-        self._count = len(self._keys_list)
+        # Populate contiguous vector matrix and index mappings with unique items only
+        self._count = len(deduped)
         if self._count > 0:
             alloc_cap = max(128, self._count * 2)
             self._matrix = np.empty((alloc_cap, self.dim), dtype=np.float32)
-            for i, v in enumerate(vectors):
-                self._matrix[i] = v
+            for slot, (k, (off, rlen, vec)) in enumerate(deduped.items()):
+                self._index[k] = (off, rlen)
+                self._keys_list.append(k)
+                self._key_to_slot[k] = slot
+                self._matrix[slot] = vec
 
     def get_exact(self, key: str) -> Optional[CacheRecord]:
         """Read a record from disk in strict O(1) time using zero-copy mmap."""
-        if key not in self._index or self._mm is None:
+        if key not in self._index:
             return None
+
+        if self._mm is None:
+            self._file.seek(0, 2)
+            if self._file.tell() == 0:
+                return None
+            self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
 
         offset, _ = self._index[key]
         klen, vlen, dim = struct.unpack_from(HEADER_FORMAT, self._mm, offset)
 
         # Read value string and vector directly from mmap
         val_start = offset + HEADER_SIZE + klen
-        val_bytes = bytes(self._mm[val_start : val_start + vlen])
+        val_bytes = self._mm[val_start : val_start + vlen]
         val = val_bytes.decode("utf-8")
 
         vec_start = val_start + vlen
@@ -167,7 +176,7 @@ class L2DiskCache:
         return None
 
     def append(self, key: str, value: str, vector: np.ndarray) -> None:
-        """Append a new record to the end of the binary file log in O(1) time."""
+        """Append a record to the persistent binary log in amortized O(1) time."""
         key_bytes = key.encode("utf-8")
         val_bytes = value.encode("utf-8")
         vec_bytes = vector.astype(np.float32).tobytes()
@@ -180,31 +189,125 @@ class L2DiskCache:
         payload = header + key_bytes + val_bytes + vec_bytes
         total_len = len(payload)
 
+        # Close existing mmap before file write (critical for Windows OS file-locking safety)
+        if self._mm is not None:
+            self._mm.close()
+            self._mm = None
+
         # Write to end of file
         self._file.seek(0, 2)
         offset = self._file.tell()
         self._file.write(payload)
         self._file.flush()
 
-        # Safely refresh mmap for future zero-copy reads
-        if self._mm is not None:
-            self._mm.close()
+        # Remap updated file
         self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
 
-        # Ensure vector table has room (geometric doubling in amortized O(1))
-        idx = self._count
-        if idx >= len(self._matrix):
-            new_cap = len(self._matrix) * 2
-            new_matrix = np.empty((new_cap, self.dim), dtype=np.float32)
-            new_matrix[:idx] = self._matrix[:idx]
-            self._matrix = new_matrix
+        # Update in-memory index card and vector matrix in O(1)
+        if key in self._key_to_slot:
+            # Key was already in L2: update existing vector slot in-place
+            slot = self._key_to_slot[key]
+            self._matrix[slot] = vector
+            self._index[key] = (offset, total_len)
+        else:
+            # New key in L2: assign new slot with geometric table doubling
+            slot = self._count
+            if slot >= len(self._matrix):
+                new_cap = max(128, len(self._matrix) * 2)
+                new_matrix = np.empty((new_cap, self.dim), dtype=np.float32)
+                new_matrix[:slot] = self._matrix[:slot]
+                self._matrix = new_matrix
 
-        self._matrix[idx] = vector
-        self._count += 1
+            self._matrix[slot] = vector
+            self._keys_list.append(key)
+            self._key_to_slot[key] = slot
+            self._index[key] = (offset, total_len)
+            self._count += 1
 
-        # Update in-memory index card and key list
-        self._index[key] = (offset, total_len)
-        self._keys_list.append(key)
+    def remove(self, key: str) -> bool:
+        """Remove an item from L2 in-memory index and vector matrix in strict O(1) time.
+
+        Uses O(1) swap-and-pop to maintain a contiguous vector matrix without holes.
+        Returns True if item was removed, False if not found.
+        """
+        if key not in self._index:
+            return False
+
+        del self._index[key]
+        slot = self._key_to_slot.pop(key)
+        last_slot = len(self._keys_list) - 1
+        last_key = self._keys_list.pop()
+
+        # If removed item was not the last slot, swap the last slot into its position
+        if slot != last_slot:
+            self._matrix[slot] = self._matrix[last_slot]
+            self._keys_list[slot] = last_key
+            self._key_to_slot[last_key] = slot
+
+        self._count -= 1
+        return True
+
+    def compact(self) -> int:
+        """Compact the append-only log file by rewriting only currently active records.
+
+        Frees disk space from deleted or superseded records.
+        Returns the number of bytes reclaimed.
+        """
+        if self._mm is not None:
+            self._mm.close()
+            self._mm = None
+
+        self._file.seek(0, 2)
+        orig_size = self._file.tell()
+        if orig_size == 0 or len(self._index) == 0:
+            return 0
+
+        temp_path = self.file_path.with_suffix(".compact")
+        new_index: dict[str, Tuple[int, int]] = {}
+
+        # Reopen file for clean sequential reading of active records
+        with open(self.file_path, "rb") as src_f, open(temp_path, "wb") as dst_f:
+            new_offset = 0
+            for key, (old_offset, record_len) in self._index.items():
+                src_f.seek(old_offset)
+                record_data = src_f.read(record_len)
+                dst_f.write(record_data)
+                new_index[key] = (new_offset, record_len)
+                new_offset += record_len
+
+        # Close existing file handle so Windows allows atomic file replacement
+        self._file.close()
+
+        import os
+        os.replace(temp_path, self.file_path)
+
+        # Reopen file and remap
+        self._file = open(self.file_path, "a+b")
+        self._index = new_index
+        new_size = new_offset
+        if new_size > 0:
+            self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+
+        reclaimed = orig_size - new_size
+        return max(0, reclaimed)
+
+    def clear(self) -> None:
+        """Clear all disk storage and truncate the file."""
+        if self._mm is not None:
+            self._mm.close()
+            self._mm = None
+        self._file.close()
+
+        # Truncate file on disk
+        with open(self.file_path, "wb"):
+            pass
+
+        self._file = open(self.file_path, "a+b")
+        self._index.clear()
+        self._keys_list.clear()
+        self._key_to_slot.clear()
+        self._matrix = np.empty((128, self.dim), dtype=np.float32)
+        self._count = 0
 
     def close(self) -> None:
         """Safely close open file handles and memory maps."""

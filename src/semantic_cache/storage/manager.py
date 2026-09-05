@@ -35,7 +35,8 @@ Lookup Flow in 4 Simple Steps:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+import threading
+from typing import Any, Callable, Optional, Tuple
 import numpy as np
 
 from semantic_cache.config import CacheConfig
@@ -61,6 +62,7 @@ class StorageManager:
         self.config = config
         self.l1 = L1RAMCache(capacity=config.ram_capacity, dim=config.vector_dim)
         self.l2 = L2DiskCache(file_path=config.disk_path, dim=config.vector_dim)
+        self._lock = threading.RLock()
 
         # Performance counters
         self._l1_hits: int = 0
@@ -71,94 +73,147 @@ class StorageManager:
     def get(
         self,
         key: str,
+        embed_fn: Optional[Callable[[str], np.ndarray]] = None,
         query_vector: Optional[np.ndarray] = None,
     ) -> Optional[LookupResult]:
-        """Search the cache hierarchy: L1 Exact -> L1 Semantic -> L2 Exact -> L2 Semantic."""
-        # 1. Check L1 Exact Hit in O(1)
-        rec = self.l1.get_exact(key)
-        if rec is not None:
-            self._l1_hits += 1
-            return LookupResult(
-                value=rec.value,
-                similarity=1.0,
-                matched_key=rec.key,
-                tier="L1_EXACT",
-            )
+        """Search the cache hierarchy: L1 Exact -> L2 Exact -> L1 Semantic -> L2 Semantic.
 
-        # 2. Check L1 Semantic Hit in O(N*d)
-        if query_vector is not None:
-            hit = self.l1.find_semantic(query_vector, self.config.similarity_threshold)
-            if hit is not None:
-                sem_rec, score = hit
+        Fast-Path Optimization:
+        Checks L1 and L2 for exact string matches first in O(1) time.
+        Only computes vector embedding when both exact checks have missed!
+        """
+        with self._lock:
+            # -----------------------------------------------------------------
+            # FAST PATH: O(1) Exact Lookups (Zero Vector Calculations)
+            # -----------------------------------------------------------------
+            # 1. Check L1 Exact Hit in O(1)
+            rec = self.l1.get_exact(key)
+            if rec is not None:
                 self._l1_hits += 1
                 return LookupResult(
-                    value=sem_rec.value,
-                    similarity=score,
-                    matched_key=sem_rec.key,
-                    tier="L1_SEMANTIC",
+                    value=rec.value,
+                    similarity=1.0,
+                    matched_key=rec.key,
+                    tier="L1_EXACT",
                 )
 
-        # 3. Check L2 Exact Hit in O(1)
-        rec = self.l2.get_exact(key)
-        if rec is not None:
-            self._l2_hits += 1
-            # Promote cold item from disk back to RAM desk!
-            self._promote_to_l1(rec)
-            return LookupResult(
-                value=rec.value,
-                similarity=1.0,
-                matched_key=rec.key,
-                tier="L2_EXACT",
-            )
-
-        # 4. Check L2 Semantic Hit in O(M*d)
-        if query_vector is not None:
-            hit = self.l2.find_semantic(query_vector, self.config.similarity_threshold)
-            if hit is not None:
-                sem_rec, score = hit
+            # 2. Check L2 Exact Hit in O(1)
+            rec = self.l2.get_exact(key)
+            if rec is not None:
                 self._l2_hits += 1
                 # Promote cold item from disk back to RAM desk!
-                self._promote_to_l1(sem_rec)
+                self._promote_to_l1(rec)
                 return LookupResult(
-                    value=sem_rec.value,
-                    similarity=score,
-                    matched_key=sem_rec.key,
-                    tier="L2_SEMANTIC",
+                    value=rec.value,
+                    similarity=1.0,
+                    matched_key=rec.key,
+                    tier="L2_EXACT",
                 )
 
-        # 5. Missed everywhere
-        self._misses += 1
-        return None
+            # -----------------------------------------------------------------
+            # SEMANTIC PATH: Vector Similarity Scan
+            # -----------------------------------------------------------------
+            # Only compute vector when exact match is a miss
+            if query_vector is None and embed_fn is not None:
+                query_vector = embed_fn(key)
+
+            if query_vector is not None:
+                # 3. Check L1 Semantic Hit in O(N*d)
+                hit = self.l1.find_semantic(query_vector, self.config.similarity_threshold)
+                if hit is not None:
+                    sem_rec, score = hit
+                    self._l1_hits += 1
+                    return LookupResult(
+                        value=sem_rec.value,
+                        similarity=score,
+                        matched_key=sem_rec.key,
+                        tier="L1_SEMANTIC",
+                    )
+
+                # 4. Check L2 Semantic Hit in O(M*d)
+                hit = self.l2.find_semantic(query_vector, self.config.similarity_threshold)
+                if hit is not None:
+                    sem_rec, score = hit
+                    self._l2_hits += 1
+                    # Promote cold item from disk back to RAM desk!
+                    self._promote_to_l1(sem_rec)
+                    return LookupResult(
+                        value=sem_rec.value,
+                        similarity=score,
+                        matched_key=sem_rec.key,
+                        tier="L2_SEMANTIC",
+                    )
+
+            # 5. Missed everywhere
+            self._misses += 1
+            return None
 
     def set(self, key: str, value: str, vector: np.ndarray) -> None:
         """Store an answer in L1 RAM. If L1 is full, spills oldest item to L2 Disk in O(1)."""
-        evicted = self.l1.put(key, value, vector)
+        with self._lock:
+            # If key was already in L2, remove it so it only lives in L1 (strict tiering)
+            if key in self.l2:
+                self.l2.remove(key)
 
-        # If an item was pushed off the desk, save it safely in the filing cabinet
-        if evicted is not None:
-            self._evictions += 1
-            self.l2.append(evicted.key, evicted.value, evicted.vector)
+            evicted = self.l1.put(key, value, vector)
+
+            # If an item was pushed off the desk, save it safely in the filing cabinet
+            if evicted is not None:
+                self._evictions += 1
+                self.l2.append(evicted.key, evicted.value, evicted.vector)
 
     def _promote_to_l1(self, record: CacheRecord) -> None:
-        """Move a cold item from L2 Disk back onto the warm L1 RAM desk."""
+        """Move a cold item from L2 Disk back onto the warm L1 RAM desk (strict tiering)."""
+        self.l2.remove(record.key)
         evicted = self.l1.put(record.key, record.value, record.vector)
         if evicted is not None:
             self._evictions += 1
             self.l2.append(evicted.key, evicted.value, evicted.vector)
 
+    def delete(self, key: str) -> bool:
+        """Delete an item from L1 and/or L2 in strict O(1) time."""
+        with self._lock:
+            del_l1 = self.l1.delete(key)
+            del_l2 = self.l2.remove(key)
+            return del_l1 or del_l2
+
+    def compact(self) -> int:
+        """Compact L2 disk storage by purging deleted and overwritten records."""
+        with self._lock:
+            return self.l2.compact()
+
+    def clear(self) -> None:
+        """Clear all cached records in both L1 RAM and L2 Disk."""
+        with self._lock:
+            self.l1.clear()
+            self.l2.clear()
+
     def stats(self) -> dict[str, Any]:
         """Return system metrics: counts, hits, misses, and evictions."""
-        return {
-            "l1_count": len(self.l1),
-            "l2_count": len(self.l2),
-            "l1_capacity": self.config.ram_capacity,
-            "l1_hits": self._l1_hits,
-            "l2_hits": self._l2_hits,
-            "total_hits": self._l1_hits + self._l2_hits,
-            "misses": self._misses,
-            "evictions": self._evictions,
-        }
+        with self._lock:
+            return {
+                "l1_count": len(self.l1),
+                "l2_count": len(self.l2),
+                "total_count": len(self.l1) + len(self.l2),
+                "l1_capacity": self.config.ram_capacity,
+                "l1_hits": self._l1_hits,
+                "l2_hits": self._l2_hits,
+                "total_hits": self._l1_hits + self._l2_hits,
+                "misses": self._misses,
+                "evictions": self._evictions,
+            }
+
+    def __len__(self) -> int:
+        """Return total unique items across L1 and L2."""
+        with self._lock:
+            return len(self.l1) + len(self.l2)
+
+    def __contains__(self, key: str) -> bool:
+        """Check membership across L1 and L2 in O(1) time."""
+        with self._lock:
+            return (key in self.l1) or (key in self.l2)
 
     def close(self) -> None:
         """Close storage handles cleanly."""
-        self.l2.close()
+        with self._lock:
+            self.l2.close()

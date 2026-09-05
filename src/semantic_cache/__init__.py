@@ -76,67 +76,7 @@ class TieredSemanticCache:
         if not query or not isinstance(query, str):
             return None
 
-        # ---------------------------------------------------------------------
-        # FAST PATH: O(1) Exact Matching (Zero Vector Computation Overhead)
-        # ---------------------------------------------------------------------
-        # 1. Check L1 RAM desk (pure dictionary lookup: ~100 nanoseconds)
-        rec = self.storage.l1.get_exact(query)
-        if rec is not None:
-            self.storage._l1_hits += 1
-            return LookupResult(
-                value=rec.value,
-                similarity=1.0,
-                matched_key=rec.key,
-                tier="L1_EXACT",
-            )
-
-        # 2. Check L2 Disk index (in-memory hash index + zero-copy mmap read)
-        rec = self.storage.l2.get_exact(query)
-        if rec is not None:
-            self.storage._l2_hits += 1
-            # Promote item back to L1 RAM
-            self.storage._promote_to_l1(rec)
-            return LookupResult(
-                value=rec.value,
-                similarity=1.0,
-                matched_key=rec.key,
-                tier="L2_EXACT",
-            )
-
-        # ---------------------------------------------------------------------
-        # SEMANTIC PATH: O((N + M) * d) Vector Similarity Search
-        # ---------------------------------------------------------------------
-        # Only compute the vector embedding when exact matches have missed!
-        vector = self.embedder.embed(query)
-
-        # 3. Check L1 RAM vectors
-        hit = self.storage.l1.find_semantic(vector, self.config.similarity_threshold)
-        if hit is not None:
-            sem_rec, score = hit
-            self.storage._l1_hits += 1
-            return LookupResult(
-                value=sem_rec.value,
-                similarity=score,
-                matched_key=sem_rec.key,
-                tier="L1_SEMANTIC",
-            )
-
-        # 4. Check L2 Disk vectors
-        hit = self.storage.l2.find_semantic(vector, self.config.similarity_threshold)
-        if hit is not None:
-            sem_rec, score = hit
-            self.storage._l2_hits += 1
-            self.storage._promote_to_l1(sem_rec)
-            return LookupResult(
-                value=sem_rec.value,
-                similarity=score,
-                matched_key=sem_rec.key,
-                tier="L2_SEMANTIC",
-            )
-
-        # 5. Missed everywhere
-        self.storage._misses += 1
-        return None
+        return self.storage.get(query, embed_fn=self.embedder.embed)
 
     def set(self, query: str, answer: str) -> None:
         """Store a question and answer pair.
@@ -149,13 +89,38 @@ class TieredSemanticCache:
             query: The query string to index.
             answer: The value/answer string to cache.
         """
-        if not query or not isinstance(query, str):
+        if not query or not isinstance(query, str) or not query.strip():
             raise ValueError("Query must be a non-empty string.")
         if not isinstance(answer, str):
             raise ValueError("Answer must be a string.")
 
         vector = self.embedder.embed(query)
         self.storage.set(key=query, value=answer, vector=vector)
+
+    def delete(self, query: str) -> bool:
+        """Delete an item from L1 and/or L2 in strict O(1) time.
+
+        Args:
+            query: The query string to remove.
+
+        Returns:
+            True if the item was found and removed, False otherwise.
+        """
+        if not query or not isinstance(query, str):
+            return False
+        return self.storage.delete(query)
+
+    def compact(self) -> int:
+        """Compact the L2 append-only disk log by purging dead/overwritten records.
+
+        Returns:
+            Number of bytes reclaimed from disk.
+        """
+        return self.storage.compact()
+
+    def clear(self) -> None:
+        """Clear all cached records in both L1 RAM and L2 Disk."""
+        self.storage.clear()
 
     def stats(self) -> Dict[str, Any]:
         """Return operational cache metrics (counts, hits, misses, evictions)."""
@@ -175,13 +140,29 @@ class TieredSemanticCache:
 
     def __len__(self) -> int:
         """Return total number of unique items across L1 and L2 tiers."""
-        return len(self.storage.l1) + len(self.storage.l2)
+        return len(self.storage)
 
     def __contains__(self, query: str) -> bool:
         """Check if a query exists in L1 or L2 in O(1) time without reading payload."""
         if not isinstance(query, str):
             return False
-        return (query in self.storage.l1) or (query in self.storage.l2)
+        return query in self.storage
+
+    def __getitem__(self, query: str) -> str:
+        """Retrieve answer string or raise KeyError if missed."""
+        res = self.get(query)
+        if res is None:
+            raise KeyError(query)
+        return res.value
+
+    def __setitem__(self, query: str, answer: str) -> None:
+        """Store query and answer pair via subscription syntax."""
+        self.set(query, answer)
+
+    def __delitem__(self, query: str) -> None:
+        """Delete query via subscription syntax or raise KeyError if missing."""
+        if not self.delete(query):
+            raise KeyError(query)
 
     def __repr__(self) -> str:
         """Return human-readable cache summary."""

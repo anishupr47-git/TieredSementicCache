@@ -100,7 +100,7 @@ class SemanticCacheServer:
             while self._running:
                 args = await RESPParser.read_command(reader)
                 if args is None:
-                    break  # Client closed connection
+                    break  # Client closed connection or malformed payload
 
                 response = self._execute_command(args)
                 writer.write(response)
@@ -109,7 +109,7 @@ class SemanticCacheServer:
                 # If client requested QUIT, close connection
                 if args and args[0].upper() == "QUIT":
                     break
-        except (ConnectionResetError, BrokenPipeError):
+        except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError, ValueError):
             pass
         finally:
             writer.close()
@@ -142,27 +142,54 @@ class SemanticCacheServer:
             self.storage.set(key, val, vector)
             return RESPSerializer.ok()
 
-        # 3. Retrieve: SEMANTIC.GET <key> (also supports standard GET)
+        # 3. Retrieve: SEMANTIC.GET <key> (fast path bypasses vector embedding on exact match)
         if cmd in ("SEMANTIC.GET", "GET"):
             if len(args) < 2:
                 return RESPSerializer.error(f"wrong number of arguments for '{cmd}'")
             key = args[1]
 
-            # Vectorize question to check meaning in both tiers
-            vector = self.embedder.embed(key)
-            result = self.storage.get(key, query_vector=vector)
+            # StorageManager checks L1 and L2 exact match in O(1) before invoking embedder
+            result = self.storage.get(key, embed_fn=self.embedder.embed)
 
             if result is None:
                 return RESPSerializer.bulk_string(None)  # $-1\r\n = Cache Miss!
             return RESPSerializer.bulk_string(result.value)
 
-        # 4. Metrics: STATS
+        # 4. Invalidate / Delete: DEL <key> or SEMANTIC.DEL <key>
+        if cmd in ("SEMANTIC.DEL", "DEL"):
+            if len(args) < 2:
+                return RESPSerializer.error(f"wrong number of arguments for '{cmd}'")
+            deleted = self.storage.delete(args[1])
+            return RESPSerializer.integer(1 if deleted else 0)
+
+        # 5. Existence check: EXISTS <key>
+        if cmd == "EXISTS":
+            if len(args) < 2:
+                return RESPSerializer.error(f"wrong number of arguments for '{cmd}'")
+            exists = args[1] in self.storage
+            return RESPSerializer.integer(1 if exists else 0)
+
+        # 6. Database size: DBSIZE
+        if cmd == "DBSIZE":
+            return RESPSerializer.integer(len(self.storage))
+
+        # 7. Metrics: STATS
         if cmd == "STATS":
             stats_dict = self.storage.stats()
             stats_json = json.dumps(stats_dict, indent=2)
             return RESPSerializer.bulk_string(stats_json)
 
-        # 5. Quit: QUIT
+        # 8. Compact L2 disk storage: COMPACT
+        if cmd == "COMPACT":
+            reclaimed = self.storage.compact()
+            return RESPSerializer.integer(reclaimed)
+
+        # 9. Clear cache: FLUSHDB / FLUSHALL
+        if cmd in ("FLUSHDB", "FLUSHALL"):
+            self.storage.clear()
+            return RESPSerializer.ok()
+
+        # 10. Quit: QUIT
         if cmd == "QUIT":
             return RESPSerializer.ok()
 
