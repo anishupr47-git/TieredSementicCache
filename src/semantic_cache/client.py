@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import socket
+import ssl
 import time
 from typing import Any, Dict, Optional
 
@@ -41,6 +42,9 @@ class SemanticCacheClient:
         port: int = 6380,
         timeout: float = 3.0,
         fallback_cache: Any = None,
+        password: Optional[str] = None,
+        use_ssl: bool = False,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ) -> None:
         """Set up client connection settings.
 
@@ -49,11 +53,17 @@ class SemanticCacheClient:
             port: Server door number (default 6380).
             timeout: How many seconds to wait for a response before timing out.
             fallback_cache: Local cache to use automatically if the server is offline.
+            password: Optional authentication password for requirepass-protected servers.
+            use_ssl: Whether to wrap TCP socket with TLS/SSL encryption.
+            ssl_context: Custom ssl.SSLContext for client-side certificate validation.
         """
         self.host = host
         self.port = port
         self.timeout = timeout
         self.fallback = fallback_cache
+        self.password = password
+        self.use_ssl = use_ssl
+        self.ssl_context = ssl_context
         self._sock: Optional[socket.socket] = None
         self._file: Optional[Any] = None
 
@@ -64,11 +74,39 @@ class SemanticCacheClient:
         try:
             s = socket.create_connection((self.host, self.port), timeout=self.timeout)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+            if self.use_ssl or self.ssl_context is not None:
+                ctx = self.ssl_context or ssl.create_default_context()
+                s = ctx.wrap_socket(s, server_hostname=self.host if self.host != "127.0.0.1" else None)
+
             self._sock = s
             self._file = s.makefile("rwb")
+
+            # If password is configured, authenticate immediately on connect
+            if self.password:
+                self._auth_on_connect(self.password)
         except Exception:
             self._disconnect()
             raise
+
+    def _auth_on_connect(self, password: str) -> None:
+        """Authenticate immediately upon connection before other commands."""
+        assert self._file is not None
+        p_bytes = password.encode("utf-8")
+        payload = (
+            b"*2\r\n$4\r\nAUTH\r\n$"
+            + str(len(p_bytes)).encode("utf-8")
+            + b"\r\n"
+            + p_bytes
+            + b"\r\n"
+        )
+        self._file.write(payload)
+        self._file.flush()
+        line = self._file.readline()
+        if not line:
+            raise ConnectionResetError("Server closed connection during AUTH")
+        if line.startswith(b"-"):
+            raise RuntimeError(line[1:].rstrip(b"\r\n").decode("utf-8"))
 
     def _disconnect(self) -> None:
         """Safely close the connection."""
@@ -132,6 +170,18 @@ class SemanticCacheClient:
 
         except Exception:
             self._disconnect()
+            raise
+
+    def auth(self, password: str) -> bool:
+        """Authenticate with the server manually."""
+        try:
+            res = self._send_command("AUTH", password)
+            self.password = password
+            return res == "OK"
+        except Exception:
+            if self.fallback is not None:
+                self.password = password
+                return True
             raise
 
     def ping(self, message: Optional[str] = None) -> str:

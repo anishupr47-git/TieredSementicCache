@@ -76,6 +76,11 @@ class StorageManager:
         self._tag_to_keys: dict[str, set[str]] = defaultdict(set)
         self._key_to_tags: dict[str, set[str]] = defaultdict(set)
 
+        # Hydrate tag index maps from persisted L2 disk records (ARCH-1)
+        for key, tags in self.l2.get_all_tags().items():
+            if tags:
+                self._update_tags(key, tags)
+
         # Performance score counters
         self._l1_hits: int = 0
         self._l2_hits: int = 0

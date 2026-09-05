@@ -321,3 +321,40 @@ def test_index_file_tail_scan_and_corruption_fallback(tmp_path):
         assert "first" in cache3.storage.l2 or "first" in cache3.storage.l1
         assert "unindexed_key" in cache3.storage.l2
 
+
+def test_tag_index_startup_rebuild(tmp_path):
+    """Test ARCH-1: Tags survive cache restart and tag invalidation works on disk-loaded data."""
+    db_path = tmp_path / "test_tag_rebuild.bin"
+    cfg = CacheConfig(
+        ram_capacity=2,
+        disk_path=db_path,
+        enable_index_file=True,
+    )
+
+    # 1. Create cache and insert items with tags that spill into L2 disk
+    with TieredSemanticCache(cfg) as cache:
+        cache.set("item_finance_1", "balance_sheet", tags=["finance", "accounting"])
+        cache.set("item_finance_2", "income_statement", tags=["finance"])
+        cache.set("item_engineering", "compiler_spec", tags=["eng"])
+        cache.set("item_hr", "payroll", tags=["hr"])
+        cache.set("item_extra_1", "extra1")
+        cache.set("item_extra_2", "extra2")
+
+        # 4 items evicted to L2 disk since ram_capacity is 2
+        assert len(cache.storage.l2) == 4
+
+    # 2. Reopen cache in a brand-new instance pointing to the same disk file
+    with TieredSemanticCache(cfg) as cache2:
+        assert len(cache2) == 4
+        # Invalidate tag 'finance' across disk-loaded records
+        purged = cache2.invalidate_tag("finance")
+        assert purged == 2
+
+        # Verify purged items are gone and remaining items still exist
+        assert cache2.get("item_finance_1") is None
+        assert cache2.get("item_finance_2") is None
+        assert cache2.get("item_engineering") is not None
+        assert cache2.get("item_hr") is not None
+        assert len(cache2) == 2
+
+

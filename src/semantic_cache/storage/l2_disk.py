@@ -77,6 +77,7 @@ class L2DiskCache:
         self._index: dict[str, Tuple[int, int]] = {}
         self._key_to_slot: dict[str, int] = {}
         self._key_expires: dict[str, float] = {}
+        self._key_tags: dict[str, tuple[str, ...]] = {}
 
         # Contiguous table of arrows for fast vector matching
         self._keys_list: list[str] = []
@@ -105,6 +106,10 @@ class L2DiskCache:
             self._count, self.file_path, loaded_from_idx,
         )
 
+    def get_all_tags(self) -> dict[str, tuple[str, ...]]:
+        """Return a mapping of key -> tags for all active items in L2 (ARCH-1)."""
+        return dict(self._key_tags)
+
     def __len__(self) -> int:
         """Count total unique answers in the filing cabinet."""
         return self._count
@@ -128,8 +133,8 @@ class L2DiskCache:
             except OSError:
                 mtime_ns = 0
 
-            magic = b"TSCIDX01"
-            header = struct.pack("<IIQQQ", 1, self.dim, self._count, db_size, mtime_ns)
+            magic = b"TSCIDX02"
+            header = struct.pack("<IIQQQ", 2, self.dim, self._count, db_size, mtime_ns)
 
             entries_bytes = bytearray()
             for k in self._keys_list[: self._count]:
@@ -137,8 +142,11 @@ class L2DiskCache:
                 exp_sec = self._key_expires.get(k)
                 exp_ms = int(exp_sec * 1000.0) if exp_sec is not None and exp_sec > 0 else 0
                 kbytes = k.encode("utf-8")
-                entries_bytes.extend(struct.pack("<HIIQ", len(kbytes), off, rlen, exp_ms))
+                tags = self._key_tags.get(k, ())
+                tbytes = ",".join(tags).encode("utf-8") if tags else b""
+                entries_bytes.extend(struct.pack("<HIIQH", len(kbytes), off, rlen, exp_ms, len(tbytes)))
                 entries_bytes.extend(kbytes)
+                entries_bytes.extend(tbytes)
 
             matrix_bytes = self._matrix[: self._count].tobytes()
             payload = magic + header + bytes(entries_bytes) + matrix_bytes
@@ -183,12 +191,14 @@ class L2DiskCache:
                 )
                 return False
 
-            if data[:8] != b"TSCIDX01":
+            is_v2 = (data[:8] == b"TSCIDX02")
+            is_v1 = (data[:8] == b"TSCIDX01")
+            if not (is_v1 or is_v2):
                 logger.warning("Index file magic bytes invalid, falling back to full scan")
                 return False
 
             version, dim, count, saved_db_size, saved_mtime_ns = struct.unpack_from("<IIQQQ", data, 8)
-            if version != 1 or dim != self.dim:
+            if (version not in (1, 2)) or dim != self.dim:
                 logger.warning("Index version (%d) or dim (%d != %d) mismatch", version, dim, self.dim)
                 return False
 
@@ -207,13 +217,24 @@ class L2DiskCache:
             keys_list: list[str] = []
             key_to_slot: dict[str, int] = {}
             key_expires: dict[str, float] = {}
+            key_tags: dict[str, tuple[str, ...]] = {}
             expiry_heap: list[Tuple[float, str]] = []
 
             for slot in range(count):
-                klen, off, rlen, exp_ms = struct.unpack_from("<HIIQ", data, pos)
-                pos += 18
-                key = data[pos : pos + klen].decode("utf-8")
-                pos += klen
+                if is_v2:
+                    klen, off, rlen, exp_ms, tlen = struct.unpack_from("<HIIQH", data, pos)
+                    pos += 20
+                    key = data[pos : pos + klen].decode("utf-8")
+                    pos += klen
+                    tstr = data[pos : pos + tlen].decode("utf-8") if tlen > 0 else ""
+                    pos += tlen
+                    if tstr:
+                        key_tags[key] = tuple(tstr.split(","))
+                else:
+                    klen, off, rlen, exp_ms = struct.unpack_from("<HIIQ", data, pos)
+                    pos += 18
+                    key = data[pos : pos + klen].decode("utf-8")
+                    pos += klen
 
                 index_map[key] = (off, rlen)
                 keys_list.append(key)
@@ -242,6 +263,7 @@ class L2DiskCache:
             self._keys_list = keys_list
             self._key_to_slot = key_to_slot
             self._key_expires = key_expires
+            self._key_tags = key_tags
             self._expiry_heap = expiry_heap
 
             # If new records were appended since index was saved, scan the tail
@@ -291,6 +313,11 @@ class L2DiskCache:
 
             expires_at_sec = (exp_ms / 1000.0) if exp_ms > 0 else None
             key = self._mm[payload_start : payload_start + klen].decode("utf-8")
+            tag_start = payload_start + klen + vlen
+            tag_bytes = self._mm[tag_start : tag_start + tag_len]
+            tag_str = tag_bytes.decode("utf-8") if tag_len > 0 else ""
+            tags = tuple(tag_str.split(",")) if tag_str else ()
+
             vec_offset = payload_start + klen + vlen + tag_len
             vec = np.frombuffer(self._mm, dtype=np.float32, count=dim, offset=vec_offset).copy()
 
@@ -299,6 +326,11 @@ class L2DiskCache:
                     self.remove(key)
                 offset += record_len
                 continue
+
+            if tags:
+                self._key_tags[key] = tags
+            else:
+                self._key_tags.pop(key, None)
 
             if key in self._key_to_slot:
                 slot = self._key_to_slot[key]
@@ -371,12 +403,18 @@ class L2DiskCache:
             key_bytes = self._mm[payload_start : payload_start + klen]
             key = key_bytes.decode("utf-8")
 
+            # Read tags
+            tag_start = payload_start + klen + vlen
+            tag_bytes = self._mm[tag_start : tag_start + tag_len]
+            tag_str = tag_bytes.decode("utf-8") if tag_len > 0 else ""
+            tags = tuple(tag_str.split(",")) if tag_str else ()
+
             # Read arrow vector
             vec_offset = payload_start + klen + vlen + tag_len
             vec = np.frombuffer(self._mm, dtype=np.float32, count=dim, offset=vec_offset).copy()
 
             # Latest version always wins
-            deduped[key] = (offset, record_len, vec, expires_at_sec)
+            deduped[key] = (offset, record_len, vec, expires_at_sec, tags)
             offset += record_len
 
         # Fill table with clean, unique items
@@ -384,11 +422,13 @@ class L2DiskCache:
         if self._count > 0:
             alloc_cap = max(128, self._count * 2)
             self._matrix = np.empty((alloc_cap, self.dim), dtype=np.float32)
-            for slot, (k, (off, rlen, vec, exp_sec)) in enumerate(deduped.items()):
+            for slot, (k, (off, rlen, vec, exp_sec, tags)) in enumerate(deduped.items()):
                 self._index[k] = (off, rlen)
                 self._keys_list.append(k)
                 self._key_to_slot[k] = slot
                 self._matrix[slot] = vec
+                if tags:
+                    self._key_tags[k] = tags
                 # TC-1: Populate expiry heap for items with TTL
                 if exp_sec is not None:
                     self._key_expires[k] = exp_sec
@@ -557,6 +597,11 @@ class L2DiskCache:
             self._index[key] = (offset, total_len)
             self._count += 1
 
+        if tags:
+            self._key_tags[key] = tuple(tags)
+        else:
+            self._key_tags.pop(key, None)
+
     def sweep_expired(self) -> int:
         """Toss out expired answers using the expiry heap (O(K) where K = expired count).
 
@@ -584,6 +629,7 @@ class L2DiskCache:
 
         del self._index[key]
         self._key_expires.pop(key, None)
+        self._key_tags.pop(key, None)
         slot = self._key_to_slot.pop(key)
         last_slot = len(self._keys_list) - 1
         last_key = self._keys_list.pop()
@@ -650,6 +696,7 @@ class L2DiskCache:
         # Reopen and remap the cleaned file
         self._file = open(self.file_path, "a+b")
         self._index = new_index
+        self._key_tags = {k: v for k, v in self._key_tags.items() if k in new_index}
         new_size = new_offset
         if new_size > 0:
             self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
@@ -682,6 +729,7 @@ class L2DiskCache:
         self._keys_list.clear()
         self._key_to_slot.clear()
         self._key_expires.clear()
+        self._key_tags.clear()
         self._matrix = np.empty((128, self.dim), dtype=np.float32)
         self._count = 0
 

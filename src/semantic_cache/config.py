@@ -43,6 +43,7 @@ Simple Math & Logic for Everyone:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -65,6 +66,9 @@ class CacheConfig:
     max_connections: int = 1000
     auto_compact_waste_ratio: float = 0.5
     enable_index_file: bool = False
+    ssl_certfile: Optional[Path | str] = None
+    ssl_keyfile: Optional[Path | str] = None
+    ssl_ca_certs: Optional[Path | str] = None
 
     def __post_init__(self) -> None:
         """Validate all settings before starting the cache."""
@@ -131,7 +135,12 @@ class CacheConfig:
                 f"max_connections must be a positive integer, got {self.max_connections}"
             )
 
-        # 10. Check requirepass is a non-empty string if provided
+        # 10. Check requirepass: fallback to env var if not set, and validate non-empty string
+        if self.requirepass is None:
+            env_pass = os.environ.get("CACHE_REQUIREPASS") or os.environ.get("TIERED_CACHE_PASSWORD")
+            if env_pass and env_pass.strip():
+                object.__setattr__(self, "requirepass", env_pass.strip())
+
         if self.requirepass is not None:
             if not isinstance(self.requirepass, str) or not self.requirepass.strip():
                 raise ValueError("requirepass must be a non-empty string if set")
@@ -153,4 +162,48 @@ class CacheConfig:
             raise TypeError(
                 f"enable_index_file must be a boolean, got {type(self.enable_index_file).__name__}"
             )
+
+        # 13. Validate TLS/SSL options if provided
+        if self.ssl_certfile is not None:
+            cert_p = Path(self.ssl_certfile).resolve()
+            if not cert_p.is_file():
+                raise FileNotFoundError(f"ssl_certfile does not exist: {self.ssl_certfile}")
+            object.__setattr__(self, "ssl_certfile", cert_p)
+
+        if self.ssl_keyfile is not None:
+            if self.ssl_certfile is None:
+                raise ValueError("ssl_certfile must be specified when ssl_keyfile is set")
+            key_p = Path(self.ssl_keyfile).resolve()
+            if not key_p.is_file():
+                raise FileNotFoundError(f"ssl_keyfile does not exist: {self.ssl_keyfile}")
+            object.__setattr__(self, "ssl_keyfile", key_p)
+
+        if self.ssl_ca_certs is not None:
+            ca_p = Path(self.ssl_ca_certs).resolve()
+            if not ca_p.is_file():
+                raise FileNotFoundError(f"ssl_ca_certs does not exist: {self.ssl_ca_certs}")
+            object.__setattr__(self, "ssl_ca_certs", ca_p)
+
+    def __repr__(self) -> str:
+        """Safe representation with secret masking for sensitive credentials."""
+        masked_pass = "'***'" if self.requirepass is not None else "None"
+        return (
+            f"CacheConfig("
+            f"ram_capacity={self.ram_capacity}, "
+            f"similarity_threshold={self.similarity_threshold}, "
+            f"disk_path={self.disk_path!r}, "
+            f"vector_dim={self.vector_dim}, "
+            f"port={self.port}, "
+            f"host={self.host!r}, "
+            f"default_ttl={self.default_ttl}, "
+            f"enable_active_sweep={self.enable_active_sweep}, "
+            f"sweep_interval_sec={self.sweep_interval_sec}, "
+            f"requirepass={masked_pass}, "
+            f"max_connections={self.max_connections}, "
+            f"auto_compact_waste_ratio={self.auto_compact_waste_ratio}, "
+            f"enable_index_file={self.enable_index_file}, "
+            f"ssl_certfile={self.ssl_certfile!r}"
+            f")"
+        )
+
 

@@ -310,6 +310,97 @@ async def test_server_extended_protocol(tmp_path):
     await server.stop()
 
 
+@pytest.mark.anyio
+async def test_server_auth_lifecycle(tmp_path):
+    """Test AUTH enforcement, pre-auth allowlist, failed auth backoff, and lockout (TEST-1, SEC-3)."""
+    import asyncio
+    from semantic_cache.server import SemanticCacheServer
+    from semantic_cache.client import SemanticCacheClient
+
+    db_path = tmp_path / "test_srv_auth.bin"
+    cfg = CacheConfig(port=6396, disk_path=db_path, requirepass="supersecret123")
+    server = SemanticCacheServer(config=cfg)
+    await server.start()
+
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", 6396)
+
+        # 1. Non-whitelisted command before auth must fail with NOAUTH
+        writer.write(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+        await writer.drain()
+        err_resp = await reader.readline()
+        assert b"NOAUTH" in err_resp
+
+        # 2. Whitelisted PING works before auth
+        writer.write(b"*1\r\n$4\r\nPING\r\n")
+        await writer.drain()
+        assert (await reader.readline()) == b"+PONG\r\n"
+
+        # 3. Wrong password fails with invalid password
+        writer.write(b"*2\r\n$4\r\nAUTH\r\n$9\r\nwrongpass\r\n")
+        await writer.drain()
+        resp = await reader.readline()
+        assert b"invalid password" in resp
+
+        # 4. Brute-force protection: 4 more failed attempts (total 5) triggers disconnect
+        for _ in range(4):
+            writer.write(b"*2\r\n$4\r\nAUTH\r\n$9\r\nwrongpass\r\n")
+            await writer.drain()
+            line = await reader.readline()
+            assert b"invalid password" in line or line == b""
+
+        # Connection should be closed by server after 5 failed attempts
+        writer.write(b"*1\r\n$4\r\nPING\r\n")
+        try:
+            await writer.drain()
+            line = await reader.readline()
+            assert line == b""
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+        # 5. Connect fresh and authenticate properly
+        reader2, writer2 = await asyncio.open_connection("127.0.0.1", 6396)
+        writer2.write(b"*2\r\n$4\r\nAUTH\r\n$14\r\nsupersecret123\r\n")
+        await writer2.drain()
+        assert (await reader2.readline()) == b"+OK\r\n"
+
+        # Now SET and GET work
+        writer2.write(b"*3\r\n$3\r\nSET\r\n$4\r\nauth\r\n$7\r\nsuccess\r\n")
+        await writer2.drain()
+        assert (await reader2.readline()) == b"+OK\r\n"
+
+        writer2.close()
+        try:
+            await writer2.wait_closed()
+        except Exception:
+            pass
+
+        # 6. Test client SDK with password parameter (in thread to avoid blocking loop)
+        def run_client_checks():
+            with SemanticCacheClient(host="127.0.0.1", port=6396, password="supersecret123") as client:
+                assert client.ping() == "PONG"
+                assert client.get("auth") == "success"
+
+        await asyncio.to_thread(run_client_checks)
+
+    finally:
+        await server.stop()
+
+
+def test_config_password_env_and_masking(monkeypatch, tmp_path):
+    """Test SEC-1: password env variable fallback and credential masking in __repr__."""
+    monkeypatch.setenv("CACHE_REQUIREPASS", "env_secret_pass")
+    cfg = CacheConfig(disk_path=tmp_path / "test_env_cfg.bin")
+    assert cfg.requirepass == "env_secret_pass"
+    assert "***" in repr(cfg)
+    assert "env_secret_pass" not in repr(cfg)
+
+
 def test_performance(tmp_path):
     """Make sure exact lookups are sub-microsecond fast!"""
     config = CacheConfig(disk_path=tmp_path / "test_perf.bin")

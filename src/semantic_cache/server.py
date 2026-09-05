@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import signal
+import ssl
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -89,14 +90,32 @@ class SemanticCacheServer:
         )
 
     async def start(self) -> None:
-        """Start listening for incoming client connections."""
+        """Start listening for incoming client connections with optional TLS."""
+        ssl_ctx: Optional[ssl.SSLContext] = None
+        if self.config.ssl_certfile is not None:
+            ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ssl_ctx.load_cert_chain(
+                certfile=str(self.config.ssl_certfile),
+                keyfile=str(self.config.ssl_keyfile) if self.config.ssl_keyfile else None,
+            )
+            if self.config.ssl_ca_certs:
+                ssl_ctx.load_verify_locations(cafile=str(self.config.ssl_ca_certs))
+                ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+            logger.info("TLS enabled on server with certificate: %s", self.config.ssl_certfile)
+
         self._server = await asyncio.start_server(
             self._handle_client,
             host=self.config.host,
             port=self.config.port,
+            ssl=ssl_ctx,
         )
         self._running = True
-        logger.info("Listening on %s:%d", self.config.host, self.config.port)
+        logger.info(
+            "Listening on %s:%d (TLS=%s)",
+            self.config.host,
+            self.config.port,
+            "yes" if ssl_ctx else "no",
+        )
 
     async def stop(self) -> None:
         """Gracefully shut down the server and close storage files."""
@@ -153,6 +172,7 @@ class SemanticCacheServer:
 
             # Per-connection auth state
             authenticated = self.config.requirepass is None  # No password = auto-authenticated
+            failed_auth_attempts = 0
 
             try:
                 while self._running:
@@ -176,11 +196,23 @@ class SemanticCacheServer:
                             writer.write(RESPSerializer.error("wrong number of arguments for 'AUTH'"))
                         elif args[1] == self.config.requirepass:
                             authenticated = True
+                            failed_auth_attempts = 0
                             logger.info("Client %s authenticated successfully", peer)
                             writer.write(RESPSerializer.ok())
                         else:
-                            logger.warning("Failed AUTH attempt from %s", peer)
+                            failed_auth_attempts += 1
+                            logger.warning("Failed AUTH attempt #%d from %s", failed_auth_attempts, peer)
                             writer.write(RESPSerializer.error("invalid password"))
+                            await writer.drain()
+                            # Progressive exponential backoff against brute-force attacks (SEC-3)
+                            backoff = min(1.0, 0.05 * (2 ** (failed_auth_attempts - 1)))
+                            await asyncio.sleep(backoff)
+                            if failed_auth_attempts >= 5:
+                                logger.warning(
+                                    "Max failed AUTH attempts (5) reached for %s; disconnecting client", peer
+                                )
+                                break
+                            continue
                         await writer.drain()
                         continue
 
