@@ -1,0 +1,327 @@
+===============================================================================
+               TIERED SEMANTIC CACHE - COMPLETE DOCUMENTATION
+===============================================================================
+
+Welcome to TieredSemanticCache!
+This document explains how the entire system works in simple, plain English
+so that anyone—developers, students, or non-technical readers—can easily
+understand and use it.
+
+-------------------------------------------------------------------------------
+TABLE OF CONTENTS
+-------------------------------------------------------------------------------
+1. What is this project and why do you need it?
+2. How does it work? (The Core Concepts in Plain English)
+   - Concept 1: The Meaning Arrow (Vector Embeddings)
+   - Concept 2: Comparing Angles (Cosine Similarity)
+   - Concept 3: The Clean Desk (L1 RAM Cache)
+   - Concept 4: The Metal Filing Cabinet (L2 Disk Cache & mmap)
+   - Concept 5: The Card-Deck Swap Trick (O(1) Swap-and-Pop)
+   - Concept 6: Expiration Timers (TTL & Active Sweeper)
+   - Concept 7: Private Rooms (Multi-Tenant Isolation: Ram vs Shyam)
+3. How to Install & Quick Start
+4. Complete Python API Reference
+   - TieredSemanticCache (Methods & Dictionary Syntax)
+   - Standalone DenseHashEmbedder
+   - NamespacedSemanticCache
+   - SemanticCacheClient (Network SDK)
+   - CacheConfig Settings
+5. Running as a 24/7 Redis Server (Wire Protocol)
+6. Speed & Time Complexity Guarantees
+7. License & Open Source Information
+
+
+===============================================================================
+1. WHAT IS THIS PROJECT AND WHY DO YOU NEED IT?
+===============================================================================
+
+Every time someone asks your AI chatbot or application a question, calling an
+AI model (like OpenAI ChatGPT, Claude, or DeepSeek) or searching a huge
+database takes 1 to 3 seconds and costs money.
+
+If 1,000 users ask the same question, you pay the AI company 1,000 times!
+
+Traditional Caches (like basic Redis):
+--------------------------------------
+A traditional cache only works if the words match letter-for-letter:
+  User 1 asks: "What are your bank opening hours?" -> Saved in cache.
+  User 2 asks: "What time does the bank open?"
+  Result: FAILED! Traditional cache says "The letters are different!" and calls
+  the expensive AI model again.
+
+TieredSemanticCache Solution:
+-----------------------------
+TieredSemanticCache understands MEANING instead of just letters!
+It realizes that "What are your bank opening hours?" and "What time does the
+bank open?" mean the exact same thing (over 70% match).
+
+It serves the saved answer in 0.01 milliseconds for $0.00!
+
+
+===============================================================================
+2. HOW DOES IT WORK? (THE CORE CONCEPTS IN PLAIN ENGLISH)
+===============================================================================
+
+Concept 1: The Meaning Arrow (Vector Embeddings)
+-----------------------------------------------
+Computers cannot read thoughts or English words; they only understand numbers.
+When you give our system a sentence, it turns it into a list of 384 numbers.
+Think of these 384 numbers as an ARROW pointing in a room:
+  - Similar questions point in almost the exact same direction.
+  - Unrelated questions point in completely different directions.
+All arrows are resized to have a length of exactly 1.0 (L2 Normalization)
+so long and short sentences are treated completely fairly.
+
+Concept 2: Comparing Angles (Cosine Similarity)
+----------------------------------------------
+To see if two questions mean the same thing, the computer multiplies matching
+numbers in both arrows and adds them together (the dot product):
+  +1.0 = Arrows point in the exact same direction (100% Identical Meaning!)
+   0.7 = 70% match in meaning (Our default threshold: a Cache Hit!)
+   0.0 = Right angle (Completely unrelated questions)
+  -1.0 = Completely opposite meaning
+
+Concept 3: The Clean Desk (L1 RAM Cache)
+----------------------------------------
+Fast computer memory (RAM) is like the top of your office desk:
+  - You keep the answers you need most frequently right in front of you.
+  - An exact question is answered in less than 1 microsecond!
+  - Your desk only has room for a certain number of papers (ram_capacity).
+  - When the desk is full, the oldest, least-used paper automatically slides
+    off the desk into the filing cabinet. (This rule is called LRU: Least
+    Recently Used).
+
+Concept 4: The Metal Filing Cabinet (L2 Disk Cache & mmap)
+----------------------------------------------------------
+The hard drive is like a giant metal filing cabinet:
+  - It can store millions of answers without filling up your computer's RAM.
+  - It uses a superpower called "mmap" (Memory Mapping):
+    Instead of slowly loading big files into memory, your computer points
+    directly to the hard drive page like pointing a finger at a book page.
+    It reads answers instantly with ZERO memory copying!
+  - Strict Exclusive Sizing: Every answer lives in only ONE place at a time.
+    If an answer in the filing cabinet is requested again, it gets promoted
+    back to the warm desk automatically.
+
+Concept 5: The Card-Deck Swap Trick (O(1) Swap-and-Pop)
+-------------------------------------------------------
+Normally, if you remove an item from the middle of a list of 10,000 items,
+the computer has to slide all 9,999 other items over to fill the hole (slow!).
+Instead, our code uses the Card-Deck Swap trick:
+When an item is removed, we grab the very last card from the deck and place
+it right into the empty hole in 1 instant step! Zero waiting time.
+
+Concept 6: Expiration Timers (TTL & Active Sweeper)
+--------------------------------------------------
+Answers don't stay fresh forever (e.g., weather or stock prices change).
+  - You can give any answer a TTL (Time-To-Live in seconds).
+  - Passive Expiration: When someone asks for an item, if its timer has
+    passed, the cache quietly tosses it out and returns None.
+  - Active Sweeper: A quiet background worker thread wakes up every 30 seconds
+    to clean out dead answers so they never waste your memory.
+
+Concept 7: Private Rooms (Multi-Tenant Isolation: Ram vs Shyam)
+--------------------------------------------------------------
+If User A (Ram) caches "What is my bank balance? -> $5,000", you never want
+User B (Shyam) to see Ram's private money!
+`NamespacedSemanticCache` gives each user their own private room. Even if
+Shyam asks the exact same question with 100% meaning similarity, the built-in
+security guard blocks access and returns None.
+
+
+===============================================================================
+3. HOW TO INSTALL & QUICK START
+===============================================================================
+
+Requirement: Python 3.9, 3.10, 3.11, 3.12, or 3.13+ on Windows, macOS, or Linux.
+
+Installation:
+-------------
+pip install tiered-semantic-cache
+
+3-Line Quick Start:
+-------------------
+from semantic_cache import TieredSemanticCache
+
+cache = TieredSemanticCache()
+cache.set("What is the capital of France?", "The capital of France is Paris.")
+
+# Ask with different words -> Instant match!
+result = cache.get("Tell me France's capital city")
+print(result.value)  # "The capital of France is Paris."
+
+
+===============================================================================
+4. COMPLETE PYTHON API REFERENCE
+===============================================================================
+
+-------------------------------------------------------------------------------
+A. TieredSemanticCache
+-------------------------------------------------------------------------------
+The main two-tier cache engine.
+
+1. cache.set(query: str, answer: str, ttl: int = None, tags: list = ())
+   Stores a question and answer.
+   - ttl  : Optional countdown timer in seconds before it expires.
+   - tags : Optional labels (e.g. tags=["sports", "football"]) for group deletion.
+
+2. cache.get(query: str) -> Optional[LookupResult]
+   Retrieves an answer. Checks exact text match first in 1 step, then compares
+   meaning arrows if exact match missed.
+   Returns a LookupResult object with:
+     - result.value       : The cached answer string.
+     - result.similarity  : 1.0 (Exact) or 0.70 - 0.99 (Semantic match).
+     - result.matched_key : The original question that matched.
+     - result.tier        : "L1_EXACT", "L1_SEMANTIC", "L2_EXACT", etc.
+     - result.ttl         : Remaining seconds before expiration.
+
+3. cache.delete(query: str) -> bool
+   Removes a question and answer completely from RAM and disk.
+
+4. cache.expire(query: str, ttl_seconds: float) -> bool
+   Sets or updates an expiration timer on an existing answer.
+
+5. cache.ttl(query: str) -> int
+   Returns remaining seconds before expiration (-2 if missing, -1 if no timer).
+
+6. cache.invalidate_tag(tag: str) -> int
+   Deletes ALL answers labeled with a given tag in 1 step.
+
+7. cache.compact() -> int
+   Re-packs the disk storage file to reclaim wasted hard drive space from
+   deleted or overwritten answers.
+
+8. cache.stats() -> dict
+   Returns cache health metrics: item counts, hits, misses, and evictions.
+
+9. cache.clear()
+   Wipes both RAM and Disk completely clean.
+
+10. Python Dictionary Syntax:
+    cache["question"] = "answer"      # Store
+    answer = cache["question"]        # Read (raises KeyError if missing)
+    "question" in cache               # Check existence (True / False)
+    len(cache)                        # Count total items
+    del cache["question"]             # Delete
+
+-------------------------------------------------------------------------------
+B. Standalone DenseHashEmbedder
+-------------------------------------------------------------------------------
+A 100% offline, lightning-fast text-to-vector engine that requires NO API keys!
+You can use it standalone for your own AI projects:
+
+from semantic_cache import DenseHashEmbedder
+
+embedder = DenseHashEmbedder(dim=384)
+vector = embedder.embed("How do I install Python?")
+# Returns a 384-dimensional NumPy array of length 1.0!
+
+-------------------------------------------------------------------------------
+C. NamespacedSemanticCache (Multi-User Privacy)
+-------------------------------------------------------------------------------
+Creates an isolated view of the cache for a specific user:
+
+global_cache = TieredSemanticCache()
+
+ram_cache = global_cache.namespace("user_ram")
+shyam_cache = global_cache.namespace("user_shyam")
+
+ram_cache.set("balance", "$5,000")
+print(ram_cache.get("balance").value)      # "$5,000"
+print(shyam_cache.get("balance"))          # None (Blocked!)
+
+-------------------------------------------------------------------------------
+D. SemanticCacheClient (Network SDK)
+-------------------------------------------------------------------------------
+Talks to the cache server over TCP network sockets:
+
+from semantic_cache import SemanticCacheClient, TieredSemanticCache
+
+client = SemanticCacheClient(
+    host="127.0.0.1",
+    port=6380,
+    fallback_cache=TieredSemanticCache()  # Fallback if server is offline!
+)
+client.set("hello", "world")
+print(client.get("hello"))  # "world"
+
+-------------------------------------------------------------------------------
+E. CacheConfig Settings
+-------------------------------------------------------------------------------
+from semantic_cache import CacheConfig
+
+config = CacheConfig(
+    ram_capacity=1000,          # Maximum items on the RAM desk (default 1000)
+    similarity_threshold=0.70,  # Meaning closeness dial (0.0 to 1.0, default 0.70)
+    disk_path="cache.db",       # Disk storage file location
+    vector_dim=384,             # Arrow coordinate count (default 384)
+    default_ttl=3600,           # Default expiration in seconds (default None)
+    enable_active_sweep=True,   # Background cleaner enabled (default True)
+    sweep_interval_sec=30.0,    # Cleaner wakes up every 30 seconds
+    port=6380,                  # Server TCP door number
+    host="127.0.0.1",           # Server address
+)
+
+
+===============================================================================
+5. RUNNING AS A 24/7 REDIS SERVER (WIRE PROTOCOL)
+===============================================================================
+
+TieredSemanticCache includes a standalone daemon that speaks standard Redis
+Serialization Protocol (RESP).
+
+Start the Server from your terminal:
+-----------------------------------
+semantic-cache-server --port 6380 --ram-capacity 5000
+
+Connect with Redis CLI (or any Redis library in Node.js, Go, Java, etc.):
+-------------------------------------------------------------------------
+redis-cli -p 6380
+
+Supported Commands:
+  - PING [msg]                 -> Health check ("+PONG")
+  - SET <key> <val>            -> Store answer ("+OK")
+  - SETEX <k> <sec> <v>        -> Store with expiration countdown
+  - GET <key>                  -> Retrieve answer (Exact or Semantic)
+  - SEMANTIC.SET <key> <val>   -> Store with vector embedding
+  - SEMANTIC.GET <key>         -> Search for meaning match
+  - DEL <key>                  -> Delete answer
+  - EXPIRE <key> <sec>         -> Set countdown timer
+  - TTL <key>                  -> Check remaining seconds
+  - TAG.INVALIDATE <tag>       -> Delete all items with tag
+  - EXISTS <key>               -> Check if key exists (1 or 0)
+  - DBSIZE                     -> Count total items
+  - STATS                      -> View hits, misses, and health as JSON
+  - COMPACT                    -> Reclaim dead disk space
+  - FLUSHDB                    -> Clear cache completely
+  - QUIT                       -> Disconnect
+
+
+===============================================================================
+6. SPEED & TIME COMPLEXITY GUARANTEES
+===============================================================================
+
+Operation                   Speed                  Details
+-------------------------------------------------------------------------------
+Exact Get (get_exact)       O(1) (~1 microsecond)  Hash lookup; skips vector math!
+Semantic Search             O((N + M) * d)         Matrix multiply across L1 + L2
+Insert / Put                O(1) amortized         Fast append or LRU disk slide
+Delete / Evict              O(1)                   Swap-and-pop slot replacement
+Tag Invalidation            O(K)                   Deletes only the K tagged items
+Disk Compaction             O(Active_Bytes)        Sequential stream rewrite
+
+
+===============================================================================
+7. LICENSE & OPEN SOURCE INFORMATION
+===============================================================================
+
+TieredSemanticCache is released under the permissive MIT License.
+You are free to use it for:
+  - Commercial products & startups
+  - Personal projects
+  - Open source applications
+  - Academic research
+
+Copyright (c) 2026 Anish and Contributors.
+Repository: https://github.com/anishupr47-git/TieredSementicCache
+===============================================================================
