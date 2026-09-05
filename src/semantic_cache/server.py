@@ -14,6 +14,7 @@ Think of it like a 24/7 drive-thru window:
 
 Supported Commands in Plain English:
 ------------------------------------
+0. AUTH <password>                -> Authenticate before using any command.
 1. PING [message]                -> Health check ("+PONG").
 2. SEMANTIC.SET <key> <val>      -> Saves question & answer across RAM/Disk ("+OK").
 3. SEMANTIC.SETEX <k> <sec> <v>  -> Saves with an expiration countdown in seconds.
@@ -35,14 +36,23 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from pathlib import Path
+import logging
+import os
+import signal
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Optional
 
 from semantic_cache.config import CacheConfig
 from semantic_cache.embedder import BaseEmbedder, DenseHashEmbedder
 from semantic_cache.protocol import RESPParser, RESPSerializer
 from semantic_cache.storage.manager import StorageManager
+
+logger = logging.getLogger("semantic_cache.server")
+
+# Commands allowed before authentication
+_PRE_AUTH_COMMANDS = frozenset({"AUTH", "PING", "QUIT"})
 
 
 class SemanticCacheServer:
@@ -60,6 +70,24 @@ class SemanticCacheServer:
         self._server: Optional[asyncio.Server] = None
         self._running: bool = False
 
+        # Connection limiter: prevents OOM from too many simultaneous clients
+        self._conn_semaphore = asyncio.Semaphore(self.config.max_connections)
+        self._active_connections: int = 0
+
+        # Thread pool for offloading blocking cache operations off the event loop
+        self._executor = ThreadPoolExecutor(
+            max_workers=min(8, (os.cpu_count() or 4) + 2),
+            thread_name_prefix="tsc-worker",
+        )
+
+        logger.info(
+            "Server initialised: ram_capacity=%d, threshold=%.2f, dim=%d, auth=%s",
+            self.config.ram_capacity,
+            self.config.similarity_threshold,
+            self.config.vector_dim,
+            "enabled" if self.config.requirepass else "disabled",
+        )
+
     async def start(self) -> None:
         """Start listening for incoming client connections."""
         self._server = await asyncio.start_server(
@@ -68,21 +96,35 @@ class SemanticCacheServer:
             port=self.config.port,
         )
         self._running = True
+        logger.info("Listening on %s:%d", self.config.host, self.config.port)
 
     async def stop(self) -> None:
         """Gracefully shut down the server and close storage files."""
+        logger.info("Shutting down server...")
         self._running = False
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        self._executor.shutdown(wait=False)
         self.storage.close()
+        logger.info("Server shutdown complete.")
 
     async def serve_forever(self) -> None:
         """Start the server and run until cancelled."""
         await self.start()
         print(f"[*] Semantic Cache Server running on {self.config.host}:{self.config.port}")
         print(f"[*] RAM Capacity: {self.config.ram_capacity} | Threshold: {self.config.similarity_threshold}")
+        if self.config.requirepass:
+            print("[*] AUTH: enabled (password required)")
+        else:
+            print("[*] AUTH: disabled (no password set)")
+
+        # Register graceful shutdown on SIGTERM (Docker/Kubernetes sends this)
+        loop = asyncio.get_running_loop()
+        if sys.platform != "win32":
+            loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.ensure_future(self.stop()))
+
         try:
             if self._server is not None:
                 await self._server.serve_forever()
@@ -97,30 +139,78 @@ class SemanticCacheServer:
         writer: asyncio.StreamWriter,
     ) -> None:
         """Handle incoming commands from a single client connection."""
-        try:
-            while self._running:
-                args = await RESPParser.read_command(reader)
-                if args is None:
-                    break  # Client closed connection or malformed payload
-
-                response = self._execute_command(args)
-                writer.write(response)
-                await writer.drain()
-
-                # If client requested QUIT, close connection
-                if args and args[0].upper() == "QUIT":
-                    break
-        except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError, ValueError):
-            pass
-        finally:
+        # Check connection limit
+        if not self._conn_semaphore._value:
+            logger.warning("Connection rejected: max_connections (%d) reached", self.config.max_connections)
+            writer.write(RESPSerializer.error("max connections reached"))
             writer.close()
+            return
+
+        async with self._conn_semaphore:
+            self._active_connections += 1
+            peer = writer.get_extra_info("peername", ("unknown", 0))
+            logger.debug("Client connected: %s", peer)
+
+            # Per-connection auth state
+            authenticated = self.config.requirepass is None  # No password = auto-authenticated
+
             try:
-                await writer.wait_closed()
-            except Exception:
+                while self._running:
+                    args = await RESPParser.read_command(reader)
+                    if args is None:
+                        break  # Client disconnected or malformed payload
+
+                    cmd = args[0].upper() if args else ""
+
+                    # Auth gate: if password is required, only allow AUTH/PING/QUIT before login
+                    if not authenticated and cmd not in _PRE_AUTH_COMMANDS:
+                        writer.write(RESPSerializer.error("NOAUTH Authentication required"))
+                        await writer.drain()
+                        continue
+
+                    # Handle AUTH command inline (fast, no need for executor)
+                    if cmd == "AUTH":
+                        if self.config.requirepass is None:
+                            writer.write(RESPSerializer.error("no password is set"))
+                        elif len(args) < 2:
+                            writer.write(RESPSerializer.error("wrong number of arguments for 'AUTH'"))
+                        elif args[1] == self.config.requirepass:
+                            authenticated = True
+                            logger.info("Client %s authenticated successfully", peer)
+                            writer.write(RESPSerializer.ok())
+                        else:
+                            logger.warning("Failed AUTH attempt from %s", peer)
+                            writer.write(RESPSerializer.error("invalid password"))
+                        await writer.drain()
+                        continue
+
+                    # Offload blocking cache work to thread pool (LAT-1)
+                    loop = asyncio.get_running_loop()
+                    response = await loop.run_in_executor(
+                        self._executor, self._execute_command, args
+                    )
+                    writer.write(response)
+                    await writer.drain()
+
+                    # If client requested QUIT, close connection
+                    if cmd == "QUIT":
+                        break
+
+            except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError, ValueError):
                 pass
+            except Exception:
+                logger.exception("Unexpected error handling client %s", peer)
+            finally:
+                self._active_connections -= 1
+                logger.debug("Client disconnected: %s (active: %d)", peer, self._active_connections)
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
     def _execute_command(self, args: list[str]) -> bytes:
-        """Route and execute a parsed command in microseconds."""
+        """Route and execute a parsed command. Runs in thread pool."""
         if not args:
             return RESPSerializer.error("empty command")
 
@@ -140,6 +230,7 @@ class SemanticCacheServer:
 
             vector = self.embedder.embed(key)
             self.storage.set(key, val, vector)
+            logger.debug("SET key=%s (len=%d)", key[:50], len(val))
             return RESPSerializer.ok()
 
         # 3. Store with TTL: SETEX <key> <seconds> <value>
@@ -155,6 +246,7 @@ class SemanticCacheServer:
 
             vector = self.embedder.embed(key)
             self.storage.set(key, val, vector, ttl=seconds)
+            logger.debug("SETEX key=%s ttl=%d", key[:50], seconds)
             return RESPSerializer.ok()
 
         # 4. Set TTL on existing key: EXPIRE <key> <seconds>
@@ -186,7 +278,9 @@ class SemanticCacheServer:
             result = self.storage.get(key, embed_fn=self.embedder.embed)
 
             if result is None:
+                logger.debug("GET miss: key=%s", key[:50])
                 return RESPSerializer.bulk_string(None)  # $-1\r\n = Cache Miss!
+            logger.debug("GET hit: key=%s tier=%s sim=%.3f", key[:50], result.tier, result.similarity)
             return RESPSerializer.bulk_string(result.value)
 
         # 7. Invalidate / Delete: DEL <key> or SEMANTIC.DEL <key>
@@ -201,6 +295,7 @@ class SemanticCacheServer:
             if len(args) < 2:
                 return RESPSerializer.error(f"wrong number of arguments for '{cmd}'")
             count = self.storage.invalidate_tag(args[1])
+            logger.debug("TAG.INVALIDATE tag=%s removed=%d", args[1], count)
             return RESPSerializer.integer(count)
 
         # 9. Existence check: EXISTS <key>
@@ -217,17 +312,21 @@ class SemanticCacheServer:
         # 11. Metrics: STATS
         if cmd == "STATS":
             stats_dict = self.storage.stats()
+            stats_dict["active_connections"] = self._active_connections
             stats_json = json.dumps(stats_dict, indent=2)
             return RESPSerializer.bulk_string(stats_json)
 
         # 12. Compact L2 disk storage: COMPACT
         if cmd == "COMPACT":
+            logger.info("COMPACT started")
             reclaimed = self.storage.compact()
+            logger.info("COMPACT finished: reclaimed %d bytes", reclaimed)
             return RESPSerializer.integer(reclaimed)
 
         # 13. Clear cache: FLUSHDB / FLUSHALL
         if cmd in ("FLUSHDB", "FLUSHALL"):
             self.storage.clear()
+            logger.info("Cache flushed via %s", cmd)
             return RESPSerializer.ok()
 
         # 14. Quit: QUIT
@@ -235,6 +334,7 @@ class SemanticCacheServer:
             return RESPSerializer.ok()
 
         # Unknown command
+        logger.warning("Unknown command: %s", args[0])
         return RESPSerializer.error(f"unknown command '{args[0]}'")
 
 
@@ -247,8 +347,18 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.70, help="Similarity match threshold (0.0 - 1.0)")
     parser.add_argument("--dim", type=int, default=384, help="Embedding vector dimension")
     parser.add_argument("--disk-path", type=str, default="cache.db", help="Path for L2 disk storage file")
+    parser.add_argument("--requirepass", type=str, default=None, help="Require password for client connections")
+    parser.add_argument("--max-connections", type=int, default=1000, help="Max simultaneous client connections")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level")
 
     cli_args = parser.parse_args()
+
+    # Configure logging
+    logging.basicConfig(
+        level=getattr(logging, cli_args.log_level),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     cfg = CacheConfig(
         ram_capacity=cli_args.ram_capacity,
@@ -257,6 +367,8 @@ def main() -> None:
         vector_dim=cli_args.dim,
         port=cli_args.port,
         host=cli_args.host,
+        requirepass=cli_args.requirepass,
+        max_connections=cli_args.max_connections,
     )
 
     server = SemanticCacheServer(config=cfg)

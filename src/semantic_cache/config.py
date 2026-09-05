@@ -61,6 +61,8 @@ class CacheConfig:
     default_ttl: Optional[int] = None
     enable_active_sweep: bool = True
     sweep_interval_sec: float = 30.0
+    requirepass: Optional[str] = None
+    max_connections: int = 1000
 
     def __post_init__(self) -> None:
         """Validate all settings before starting the cache."""
@@ -102,14 +104,33 @@ class CacheConfig:
                 f"sweep_interval_sec must be positive, got {self.sweep_interval_sec}"
             )
 
-        # 7. Convert text file path to a proper Path object
+        # 7. Sanitise and validate disk_path (prevents path traversal attacks)
         if isinstance(self.disk_path, str):
             object.__setattr__(self, "disk_path", Path(self.disk_path))
         elif not isinstance(self.disk_path, Path):
             raise TypeError(
                 f"disk_path must be a string or Path, got {type(self.disk_path).__name__}"
             )
+        resolved = self.disk_path.resolve()
+        for part in resolved.parts:
+            if part == "..":
+                raise ValueError(
+                    f"disk_path must not contain '..' segments, got {self.disk_path}"
+                )
+        object.__setattr__(self, "disk_path", resolved)
 
         # 8. Ensure threshold is stored as a float number
         if isinstance(self.similarity_threshold, int):
             object.__setattr__(self, "similarity_threshold", float(self.similarity_threshold))
+
+        # 9. Check max_connections is a positive whole number
+        if type(self.max_connections) is not int or self.max_connections <= 0:
+            raise ValueError(
+                f"max_connections must be a positive integer, got {self.max_connections}"
+            )
+
+        # 10. Check requirepass is a non-empty string if provided
+        if self.requirepass is not None:
+            if not isinstance(self.requirepass, str) or not self.requirepass.strip():
+                raise ValueError("requirepass must be a non-empty string if set")
+

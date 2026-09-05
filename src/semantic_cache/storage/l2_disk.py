@@ -38,6 +38,7 @@ Simple Math & Logic in Points:
 
 from __future__ import annotations
 
+import logging
 import mmap
 import os
 from pathlib import Path
@@ -45,6 +46,8 @@ import struct
 import time
 from typing import Optional, Sequence, Tuple
 import numpy as np
+
+logger = logging.getLogger("semantic_cache.l2_disk")
 
 from semantic_cache.storage.l1_ram import CacheRecord
 
@@ -80,6 +83,7 @@ class L2DiskCache:
 
         # Scan existing records from previous sessions
         self._build_index()
+        logger.info("L2DiskCache loaded: %d records from %s", self._count, self.file_path)
 
     def __len__(self) -> int:
         """Count total unique answers in the filing cabinet."""
@@ -113,6 +117,7 @@ class L2DiskCache:
             record_len = HEADER_SIZE + klen + vlen + tag_len + (dim * 4)
 
             if offset + record_len > size:
+                logger.warning("Truncated record at offset %d (expected %d bytes, only %d remain)", offset, record_len, size - offset)
                 break  # Incomplete record at the end of the file
 
             # Skip expired entries
@@ -197,17 +202,29 @@ class L2DiskCache:
         active_matrix = self._matrix[: self._count]
         scores = np.dot(active_matrix, query_vector)
 
-        candidate_indices = np.argsort(-scores)
+        # O(N) single-pass: find the best score first
+        best_idx = int(np.argmax(scores))
+        best_score = float(scores[best_idx])
 
+        if best_score < threshold:
+            return None  # Nothing close enough
+
+        best_key = self._keys_list[best_idx]
+        record = self.get_exact(best_key)
+        if record is not None:
+            return record, best_score
+
+        # Best was expired — fall back to sorted scan for remaining candidates
+        candidate_indices = np.argsort(-scores)
         for idx in candidate_indices:
             score = float(scores[idx])
             if score < threshold:
                 break
 
-            best_key = self._keys_list[idx]
-            record = self.get_exact(best_key)
-            if record is not None:
-                return record, score
+            cand_key = self._keys_list[idx]
+            cand_record = self.get_exact(cand_key)
+            if cand_record is not None:
+                return cand_record, score
 
         return None
 
@@ -336,6 +353,7 @@ class L2DiskCache:
             self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
 
         reclaimed = orig_size - new_size
+        logger.info("Compaction finished: %d bytes reclaimed (%.1f%% waste)", max(0, reclaimed), (reclaimed / max(orig_size, 1)) * 100)
         return max(0, reclaimed)
 
     def clear(self) -> None:

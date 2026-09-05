@@ -33,10 +33,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import logging
 import threading
 import time
 from typing import Any, Callable, Optional, Sequence, Tuple
 import numpy as np
+
+logger = logging.getLogger("semantic_cache.storage")
 
 from semantic_cache.config import CacheConfig
 from semantic_cache.storage.l1_ram import CacheRecord, L1RAMCache
@@ -86,14 +89,17 @@ class StorageManager:
                 daemon=True,
             )
             self._sweep_thread.start()
+            logger.debug("Active sweep thread started (interval=%.1fs)", self.config.sweep_interval_sec)
 
     def _active_sweep_loop(self) -> None:
         """Background helper that wakes up periodically to toss out expired records."""
         while not self._stop_sweep.wait(timeout=self.config.sweep_interval_sec):
             try:
-                self.sweep_expired()
+                swept = self.sweep_expired()
+                if swept > 0:
+                    logger.debug("Sweep cleaned %d expired items", swept)
             except Exception:
-                pass
+                logger.warning("Sweep cycle failed", exc_info=True)
 
     def get(
         self,
@@ -178,6 +184,7 @@ class StorageManager:
 
             # 5. Missed everywhere
             self._misses += 1
+            logger.debug("Cache miss: key=%s", key[:80])
             return None
 
     def set(

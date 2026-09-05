@@ -136,26 +136,40 @@ class L1RAMCache:
         active_matrix = self._matrix[:count]
         scores = np.dot(active_matrix, query_vector)
 
-        # Check candidates from highest score to lowest
-        candidate_indices = np.argsort(-scores)
+        # O(N) single-pass: find the best score first
+        best_idx = int(np.argmax(scores))
+        best_score = float(scores[best_idx])
 
+        if best_score < threshold:
+            return None  # Nothing close enough
+
+        # Check if best candidate is valid (not expired)
+        candidate_key = self._matrix_keys[best_idx]
+        rec = self._records.get(candidate_key)
+        if rec is not None and not rec.is_expired:
+            self._records.move_to_end(candidate_key, last=True)
+            return rec, best_score
+
+        # Best was expired — fall back to sorted scan for remaining candidates
+        if rec is not None and rec.is_expired:
+            self.delete(candidate_key)
+
+        candidate_indices = np.argsort(-scores)
         for idx in candidate_indices:
             score = float(scores[idx])
             if score < threshold:
-                break  # The rest are too low to be a match
+                break
 
-            candidate_key = self._matrix_keys[idx]
-            rec = self._records.get(candidate_key)
-            if rec is None:
+            cand_key = self._matrix_keys[idx]
+            cand_rec = self._records.get(cand_key)
+            if cand_rec is None:
+                continue
+            if cand_rec.is_expired:
+                self.delete(cand_key)
                 continue
 
-            if rec.is_expired:
-                self.delete(candidate_key)
-                continue
-
-            # Valid match found! Mark as recently used and return it
-            self._records.move_to_end(candidate_key, last=True)
-            return rec, score
+            self._records.move_to_end(cand_key, last=True)
+            return cand_rec, score
 
         return None
 

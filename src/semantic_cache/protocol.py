@@ -29,8 +29,8 @@ import asyncio
 from typing import Optional, Sequence, Union
 
 
-MAX_ARGS = 1024
-MAX_BULK_LEN = 64 * 1024 * 1024  # 64 MB max payload
+MAX_ARGS = 128
+MAX_BULK_LEN = 1 * 1024 * 1024  # 1 MB max per argument (cache payloads are small)
 
 
 class RESPSerializer:
