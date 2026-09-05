@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiered-semantic-cache"
+version = "0.1.0"
+description = "A high-performance two-tiered (RAM + Disk) semantic cache for LLMs and AI applications with sub-millisecond retrieval."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [
+    { name = "Anish" }
+]
+keywords = [
+    "semantic-cache",
+    "llm",
+    "openai",
+    "cache",
+    "embeddings",
+    "vector-search",
+    "similarity",
+    "redis",
+    "fastapi",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "anyio>=4.0.0",
+    "twine>=4.0.0",
+]
+
+[project.scripts]
+semantic-cache-server = "semantic_cache.server:main"
+
+[project.urls]
+"Homepage" = "https://github.com/anishupr47-git/TieredSementicCache"
+"Bug Tracker" = "https://github.com/anishupr47-git/TieredSementicCache/issues"
+"Source Code" = "https://github.com/anishupr47-git/TieredSementicCache"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

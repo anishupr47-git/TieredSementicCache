@@ -1,0 +1,6 @@
+numpy>=1.20.0
+pytest>=7.0.0
+anyio>=4.0.0
+setuptools>=61.0.0
+wheel>=0.38.0
+twine>=4.0.0

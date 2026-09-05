@@ -1,0 +1,8 @@
+include LICENSE
+include README.md
+include requirements.txt
+include requirements-dev.txt
+include pyproject.toml
+recursive-include src/semantic_cache *.py
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
