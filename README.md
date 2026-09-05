@@ -242,6 +242,8 @@ config = CacheConfig(
     default_ttl=3600,            # Default expiration (1 hour)
     enable_active_sweep=True,    # Automatic background cleaner
     sweep_interval_sec=30.0,     # Clean every 30 seconds
+    auto_compact_waste_ratio=0.5,# Auto-compact disk when dead space > 50%
+    enable_index_file=False,     # Fast instant startup via .idx index file
 )
 
 cache = TieredSemanticCache(config=config)

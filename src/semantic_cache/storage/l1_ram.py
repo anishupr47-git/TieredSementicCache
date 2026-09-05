@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import heapq
 import time
 from typing import Optional, Sequence, Tuple
 import numpy as np
@@ -84,6 +85,9 @@ class L1RAMCache:
         self._matrix_keys: list[str] = []
         self._key_to_slot: dict[str, int] = {}
 
+        # 3. TC-1: Expiry min-heap for O(K) sweep instead of O(N) full scan
+        self._expiry_heap: list[Tuple[float, str]] = []
+
     def __len__(self) -> int:
         """Count how many items are currently on the desk."""
         return len(self._records)
@@ -123,10 +127,15 @@ class L1RAMCache:
         self,
         query_vector: np.ndarray,
         threshold: float,
+        key_prefix: Optional[str] = None,
     ) -> Optional[Tuple[CacheRecord, float]]:
         """Find the closest matching answer by comparing arrow directions.
 
         Skips and removes any expired items automatically.
+
+        Args:
+            key_prefix: If set, only match keys that start with this prefix.
+                        Used by namespaced caches to prevent cross-tenant leaks.
         """
         count = len(self._matrix_keys)
         if count == 0:
@@ -135,6 +144,12 @@ class L1RAMCache:
         # Multiply question arrow against all active arrows in 1 instant hardware step
         active_matrix = self._matrix[:count]
         scores = np.dot(active_matrix, query_vector)
+
+        # SEC-4: Mask out keys that don't belong to this namespace
+        if key_prefix is not None:
+            for i, k in enumerate(self._matrix_keys[:count]):
+                if not k.startswith(key_prefix):
+                    scores[i] = -2.0  # Below any valid threshold
 
         # O(N) single-pass: find the best score first
         best_idx = int(np.argmax(scores))
@@ -214,6 +229,10 @@ class L1RAMCache:
         self._matrix_keys.append(key)
         self._key_to_slot[key] = slot
 
+        # TC-1: Track expiry in the min-heap for fast sweep
+        if expires_at is not None and expires_at > 0:
+            heapq.heappush(self._expiry_heap, (expires_at, key))
+
         return evicted
 
     def expire(self, key: str, ttl_seconds: float) -> bool:
@@ -225,6 +244,8 @@ class L1RAMCache:
             self.delete(key)
             return False
         rec.expires_at = time.time() + ttl_seconds
+        # TC-1: Track new expiry in the heap
+        heapq.heappush(self._expiry_heap, (rec.expires_at, key))
         return True
 
     def ttl(self, key: str) -> int:
@@ -238,11 +259,23 @@ class L1RAMCache:
         return rec.ttl
 
     def sweep_expired(self) -> int:
-        """Active cleanup: scan the desk and toss out all expired answers."""
-        expired_keys = [k for k, r in self._records.items() if r.is_expired]
-        for k in expired_keys:
-            self.delete(k)
-        return len(expired_keys)
+        """Active cleanup using expiry heap (O(K) where K = expired count).
+
+        Instead of scanning all N records, we pop from the min-heap only
+        items whose expiration time has passed. Much faster when N is large.
+        """
+        now = time.time()
+        swept = 0
+        while self._expiry_heap:
+            earliest_exp, earliest_key = self._expiry_heap[0]
+            if earliest_exp > now:
+                break  # Everything left in the heap hasn't expired yet
+            heapq.heappop(self._expiry_heap)
+            # Key may have been updated/deleted since it was added to the heap
+            if earliest_key in self._records and self._records[earliest_key].is_expired:
+                self.delete(earliest_key)
+                swept += 1
+        return swept
 
     def delete(self, key: str) -> bool:
         """Remove an item from the desk in 1 instant step."""

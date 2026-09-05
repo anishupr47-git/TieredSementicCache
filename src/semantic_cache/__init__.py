@@ -27,7 +27,7 @@ Simple Math & Logic in Points:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from semantic_cache.client import SemanticCacheClient
 from semantic_cache.config import CacheConfig
@@ -54,7 +54,7 @@ class TieredSemanticCache:
         self.embedder = embedder or DenseHashEmbedder(dim=self.config.vector_dim)
         self.storage = StorageManager(self.config)
 
-    def get(self, query: str) -> Optional[LookupResult]:
+    def get(self, query: str, _key_prefix: Optional[str] = None) -> Optional[LookupResult]:
         """Look up an answer for a question (exact or similar meaning).
 
         How it works:
@@ -65,6 +65,8 @@ class TieredSemanticCache:
 
         Args:
             query: The user's question or prompt.
+            _key_prefix: Internal. Restricts semantic search to keys starting with
+                         this prefix (used by namespaced caches for tenant isolation).
 
         Returns:
             LookupResult with the answer and similarity score, or None if missed.
@@ -72,7 +74,7 @@ class TieredSemanticCache:
         if not query or not isinstance(query, str):
             return None
 
-        return self.storage.get(query, embed_fn=self.embedder.embed)
+        return self.storage.get(query, embed_fn=self.embedder.embed, key_prefix=_key_prefix)
 
     def set(
         self,
@@ -133,6 +135,14 @@ class TieredSemanticCache:
     def compact(self) -> int:
         """Clean up the disk file to reclaim wasted hard drive space."""
         return self.storage.compact()
+
+    def sweep_expired(self) -> int:
+        """Toss out all expired items across both RAM and Disk."""
+        return self.storage.sweep_expired()
+
+    def waste_stats(self) -> Tuple[int, int, float]:
+        """PR-6: Check disk file waste stats: (total_size, wasted_bytes, waste_ratio)."""
+        return self.storage.l2.waste_stats()
 
     def clear(self) -> None:
         """Wipe the entire cache clean."""
@@ -198,12 +208,13 @@ class NamespacedSemanticCache:
 
     def get(self, query: str) -> Optional[LookupResult]:
         """Look up an answer, strictly ensuring no other user's data can ever be seen."""
-        res = self._cache.get(self._prefix_key(query))
+        prefix = f"{self.namespace}:"
+        # SEC-4: Pre-filter vectors by namespace BEFORE the dot-product
+        res = self._cache.get(self._prefix_key(query), _key_prefix=prefix)
         if res is None:
             return None
 
-        prefix = f"{self.namespace}:"
-        # Security Guard: Make sure the match belongs to THIS user's namespace!
+        # Security Guard: Double-check the match belongs to THIS user's namespace
         if not res.matched_key.startswith(prefix):
             return None
 

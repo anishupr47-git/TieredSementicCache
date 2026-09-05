@@ -65,7 +65,11 @@ class StorageManager:
         """Initialize both storage tiers using system settings."""
         self.config = config
         self.l1 = L1RAMCache(capacity=config.ram_capacity, dim=config.vector_dim)
-        self.l2 = L2DiskCache(file_path=config.disk_path, dim=config.vector_dim)
+        self.l2 = L2DiskCache(
+            file_path=config.disk_path,
+            dim=config.vector_dim,
+            enable_index_file=config.enable_index_file,
+        )
         self._lock = threading.RLock()
 
         # Tag index folders: tag -> set(keys) and key -> set(tags)
@@ -106,12 +110,17 @@ class StorageManager:
         key: str,
         embed_fn: Optional[Callable[[str], np.ndarray]] = None,
         query_vector: Optional[np.ndarray] = None,
+        key_prefix: Optional[str] = None,
     ) -> Optional[LookupResult]:
         """Search the cache hierarchy: L1 Exact -> L2 Exact -> L1 Semantic -> L2 Semantic.
 
         Fast-Path Optimization:
         Checks L1 and L2 for exact matches first. Only converts text into
         an arrow vector when both exact checks have missed!
+
+        Args:
+            key_prefix: If set, semantic search only considers keys starting
+                        with this prefix (prevents cross-tenant matches).
         """
         with self._lock:
             # -----------------------------------------------------------------
@@ -153,7 +162,7 @@ class StorageManager:
 
             if query_vector is not None:
                 # 3. Check Desk for meaning match
-                hit = self.l1.find_semantic(query_vector, self.config.similarity_threshold)
+                hit = self.l1.find_semantic(query_vector, self.config.similarity_threshold, key_prefix=key_prefix)
                 if hit is not None:
                     sem_rec, score = hit
                     self._l1_hits += 1
@@ -167,7 +176,7 @@ class StorageManager:
                     )
 
                 # 4. Check Filing Cabinet for meaning match
-                hit = self.l2.find_semantic(query_vector, self.config.similarity_threshold)
+                hit = self.l2.find_semantic(query_vector, self.config.similarity_threshold, key_prefix=key_prefix)
                 if hit is not None:
                     sem_rec, score = hit
                     self._l2_hits += 1
@@ -280,22 +289,74 @@ class StorageManager:
             return -2
 
     def invalidate_tag(self, tag: str) -> int:
-        """Delete all cached items labeled with a specific tag."""
+        """Delete all cached items labeled with a specific tag (batch single-pass).
+
+        TC-2 Optimization: Instead of calling delete() N times (each of which
+        re-iterates the tag index), we directly pop the tag and do one pass.
+        """
         with self._lock:
-            keys = list(self._tag_to_keys.get(tag, set()))
+            keys = list(self._tag_to_keys.pop(tag, set()))
+            if not keys:
+                return 0
+
             count = 0
             for k in keys:
-                if self.delete(k):
+                # Remove only THIS tag from the key's tag set (skip full _update_tags)
+                key_tags = self._key_to_tags.get(k)
+                if key_tags:
+                    key_tags.discard(tag)
+                    if not key_tags:
+                        self._key_to_tags.pop(k, None)
+
+                # Remove from both tiers directly
+                del_l1 = self.l1.delete(k)
+                del_l2 = self.l2.remove(k)
+                if del_l1 or del_l2:
                     count += 1
+
+            logger.debug("Batch tag invalidation: tag=%s, removed=%d keys", tag, count)
             return count
 
     def sweep_expired(self) -> int:
-        """Toss out all expired items across both the desk and the cabinet."""
+        """Toss out all expired items across both the desk and the cabinet.
+
+        SEC-5: Wraps each tier's sweep in error handling so an issue in one tier
+        does not prevent the other tier from cleaning up.
+        PR-6: Automatically triggers disk compaction if dead space from TTL updates
+        exceeds the configured waste ratio threshold.
+        """
         with self._lock:
-            swept_l1 = self.l1.sweep_expired()
-            swept_l2 = self.l2.sweep_expired()
-            total = swept_l1 + swept_l2
+            total = 0
+            try:
+                swept_l1 = self.l1.sweep_expired()
+                total += swept_l1
+            except Exception as e:
+                logger.error("L1 sweep_expired failed: %s", e, exc_info=True)
+
+            try:
+                swept_l2 = self.l2.sweep_expired()
+                total += swept_l2
+            except Exception as e:
+                logger.error("L2 sweep_expired failed: %s", e, exc_info=True)
+
             self._expired_purges += total
+
+            # PR-6: Auto-compact if wasted disk space exceeds threshold
+            if self.config.auto_compact_waste_ratio > 0:
+                try:
+                    total_size, wasted, ratio = self.l2.waste_stats()
+                    # Only trigger auto-compact if waste is non-trivial (>64KB) and exceeds threshold
+                    if wasted > 65536 and ratio >= self.config.auto_compact_waste_ratio:
+                        logger.info(
+                            "Auto-compacting L2 disk: waste ratio %.1f%% (%d/%d bytes)",
+                            ratio * 100.0,
+                            wasted,
+                            total_size,
+                        )
+                        self.l2.compact()
+                except Exception as e:
+                    logger.warning("Auto-compact check failed: %s", e, exc_info=True)
+
             return total
 
     def delete(self, key: str) -> bool:
@@ -307,9 +368,19 @@ class StorageManager:
             return del_l1 or del_l2
 
     def compact(self) -> int:
-        """Clean up the filing cabinet file on disk to free up wasted space."""
+        """Clean up the filing cabinet file on disk to free up wasted space.
+
+        LAT-5 Note: This holds the global lock during file rewrite.
+        Since _execute_command runs in a thread pool (LAT-1 fix), this
+        won't block the event loop, but it will block other cache ops.
+        """
         with self._lock:
-            return self.l2.compact()
+            start = time.time()
+            reclaimed = self.l2.compact()
+            elapsed_ms = (time.time() - start) * 1000
+            if elapsed_ms > 100:
+                logger.warning("compact() took %.1fms (held lock the entire time)", elapsed_ms)
+            return reclaimed
 
     def clear(self) -> None:
         """Wipe both desk and filing cabinet clean."""

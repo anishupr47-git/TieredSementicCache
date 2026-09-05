@@ -258,9 +258,30 @@ config = CacheConfig(
     default_ttl=3600,           # Default expiration in seconds (default None)
     enable_active_sweep=True,   # Background cleaner enabled (default True)
     sweep_interval_sec=30.0,    # Cleaner wakes up every 30 seconds
+    auto_compact_waste_ratio=0.5, # Auto-compact disk when dead space exceeds 50%
+    enable_index_file=False,    # Fast instant startup via .idx index file (TC-3)
+    requirepass=None,           # Optional authentication password (SEC-1)
+    max_connections=1000,       # Maximum concurrent client connections (PR-4)
     port=6380,                  # Server TCP door number
     host="127.0.0.1",           # Server address
 )
+
+NOTE ON DISK MAINTENANCE & FAST STARTUP:
+----------------------------------------
+* Auto-Compaction (PR-6):
+  Because disk writes are append-only for maximum speed, updating TTLs or
+  deleting items leaves behind dead space. The background sweeper checks
+  waste periodically; if dead space exceeds 64KB and the waste ratio reaches
+  auto_compact_waste_ratio (default 50%), it automatically runs compact() to
+  reclaim disk space without manual intervention.
+
+* Fast Instant Startup (TC-3):
+  When enable_index_file=True, the cache saves a compact, CRC32-verified
+  index file (.idx) on shutdown or compaction. On next startup, the cache
+  restores all memory structures in ~1 millisecond instead of linearly
+  scanning the entire binary log! If an unexpected crash occurs, it cleanly
+  fast-forwards unindexed tail records or falls back to full scanning.
+
 
 
 ===============================================================================

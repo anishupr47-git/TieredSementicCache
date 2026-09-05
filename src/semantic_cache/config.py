@@ -63,6 +63,8 @@ class CacheConfig:
     sweep_interval_sec: float = 30.0
     requirepass: Optional[str] = None
     max_connections: int = 1000
+    auto_compact_waste_ratio: float = 0.5
+    enable_index_file: bool = False
 
     def __post_init__(self) -> None:
         """Validate all settings before starting the cache."""
@@ -133,4 +135,22 @@ class CacheConfig:
         if self.requirepass is not None:
             if not isinstance(self.requirepass, str) or not self.requirepass.strip():
                 raise ValueError("requirepass must be a non-empty string if set")
+
+        # 11. Check auto_compact_waste_ratio is between 0.0 and 1.0
+        if (
+            not isinstance(self.auto_compact_waste_ratio, (int, float))
+            or isinstance(self.auto_compact_waste_ratio, bool)
+            or not (0.0 <= float(self.auto_compact_waste_ratio) <= 1.0)
+        ):
+            raise ValueError(
+                f"auto_compact_waste_ratio must be a float between 0.0 and 1.0, got {self.auto_compact_waste_ratio}"
+            )
+        if isinstance(self.auto_compact_waste_ratio, int):
+            object.__setattr__(self, "auto_compact_waste_ratio", float(self.auto_compact_waste_ratio))
+
+        # 12. Check enable_index_file is a boolean
+        if not isinstance(self.enable_index_file, bool):
+            raise TypeError(
+                f"enable_index_file must be a boolean, got {type(self.enable_index_file).__name__}"
+            )
 
