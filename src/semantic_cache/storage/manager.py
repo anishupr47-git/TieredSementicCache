@@ -1,3 +1,34 @@
+"""
+Tiered Semantic Cache - Storage Manager (The "Office Boss")
+===========================================================
+
+What is this file?
+------------------
+This file coordinates our two-tier storage system:
+- L1 RAM: Fast Office Desk (holds items in quick memory).
+- L2 Disk: Metal Filing Cabinet (saves older items to the hard drive).
+
+How the Boss Handles Lookups (The Super-Fast Hierarchy):
+--------------------------------------------------------
+1. Fast-Path Exact Lookups (Bypasses vector math entirely):
+   - Step 1: Check the Desk (L1 RAM) for an exact match. (Instant ~1 microsecond!)
+   - Step 2: Check the Filing Cabinet (L2 Disk) for an exact match.
+             If found on disk, the boss promotes it back onto the warm desk.
+   - If an exact match is found, we NEVER waste time converting text to an arrow!
+
+2. Semantic Meaning Scan (When exact match misses):
+   - Step 3: Turn your question into an arrow vector.
+   - Step 4: Multiply against arrows on the Desk (L1).
+   - Step 5: Multiply against arrows in the Cabinet (L2).
+   - If found in the cabinet, promote it back onto the warm desk.
+
+Thread Safety & Background Cleanup:
+-----------------------------------
+- Lock Protection: All actions use an RLock so multiple customer threads can't clash.
+- Active Sweeper: A quiet background worker thread wakes up periodically to toss
+  out expired answers automatically.
+"""
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -25,27 +56,27 @@ class LookupResult:
 
 
 class StorageManager:
-    """Orchestrates L1 in-memory cache and L2 persistent disk storage with TTL & Tagging."""
+    """Boss coordinating L1 in-memory cache and L2 persistent disk storage."""
 
     def __init__(self, config: CacheConfig) -> None:
-        """Initialize both tiers using system configuration."""
+        """Initialize both storage tiers using system settings."""
         self.config = config
         self.l1 = L1RAMCache(capacity=config.ram_capacity, dim=config.vector_dim)
         self.l2 = L2DiskCache(file_path=config.disk_path, dim=config.vector_dim)
         self._lock = threading.RLock()
 
-        # Tag indexing structures
+        # Tag index folders: tag -> set(keys) and key -> set(tags)
         self._tag_to_keys: dict[str, set[str]] = defaultdict(set)
         self._key_to_tags: dict[str, set[str]] = defaultdict(set)
 
-        # Performance counters
+        # Performance score counters
         self._l1_hits: int = 0
         self._l2_hits: int = 0
         self._misses: int = 0
         self._evictions: int = 0
         self._expired_purges: int = 0
 
-        # Background active expiration sweeper
+        # Background active expiration sweeper thread
         self._stop_sweep = threading.Event()
         self._sweep_thread: Optional[threading.Thread] = None
         if self.config.enable_active_sweep:
@@ -57,7 +88,7 @@ class StorageManager:
             self._sweep_thread.start()
 
     def _active_sweep_loop(self) -> None:
-        """Background daemon thread periodically sweeping expired records."""
+        """Background helper that wakes up periodically to toss out expired records."""
         while not self._stop_sweep.wait(timeout=self.config.sweep_interval_sec):
             try:
                 self.sweep_expired()
@@ -73,14 +104,14 @@ class StorageManager:
         """Search the cache hierarchy: L1 Exact -> L2 Exact -> L1 Semantic -> L2 Semantic.
 
         Fast-Path Optimization:
-        Checks L1 and L2 for exact string matches first in O(1) time.
-        Only computes vector embedding when both exact checks have missed!
+        Checks L1 and L2 for exact matches first. Only converts text into
+        an arrow vector when both exact checks have missed!
         """
         with self._lock:
             # -----------------------------------------------------------------
-            # FAST PATH: O(1) Exact Lookups (Zero Vector Calculations)
+            # FAST PATH: 1-Step Exact Lookups (Zero vector math needed!)
             # -----------------------------------------------------------------
-            # 1. Check L1 Exact Hit in O(1)
+            # 1. Check Desk (L1 RAM)
             rec = self.l1.get_exact(key)
             if rec is not None:
                 self._l1_hits += 1
@@ -93,11 +124,11 @@ class StorageManager:
                     tags=rec.tags,
                 )
 
-            # 2. Check L2 Exact Hit in O(1)
+            # 2. Check Filing Cabinet (L2 Disk)
             rec = self.l2.get_exact(key)
             if rec is not None:
                 self._l2_hits += 1
-                # Promote cold item from disk back to RAM desk!
+                # Promote from cabinet back onto desk!
                 self._promote_to_l1(rec)
                 return LookupResult(
                     value=rec.value,
@@ -109,14 +140,13 @@ class StorageManager:
                 )
 
             # -----------------------------------------------------------------
-            # SEMANTIC PATH: Vector Similarity Scan
+            # SEMANTIC PATH: Meaning Search by Comparing Arrows
             # -----------------------------------------------------------------
-            # Only compute vector when exact match is a miss
             if query_vector is None and embed_fn is not None:
                 query_vector = embed_fn(key)
 
             if query_vector is not None:
-                # 3. Check L1 Semantic Hit in O(N*d)
+                # 3. Check Desk for meaning match
                 hit = self.l1.find_semantic(query_vector, self.config.similarity_threshold)
                 if hit is not None:
                     sem_rec, score = hit
@@ -130,12 +160,12 @@ class StorageManager:
                         tags=sem_rec.tags,
                     )
 
-                # 4. Check L2 Semantic Hit in O(M*d)
+                # 4. Check Filing Cabinet for meaning match
                 hit = self.l2.find_semantic(query_vector, self.config.similarity_threshold)
                 if hit is not None:
                     sem_rec, score = hit
                     self._l2_hits += 1
-                    # Promote cold item from disk back to RAM desk!
+                    # Promote from cabinet back onto desk!
                     self._promote_to_l1(sem_rec)
                     return LookupResult(
                         value=sem_rec.value,
@@ -158,22 +188,20 @@ class StorageManager:
         ttl: Optional[int] = None,
         tags: Sequence[str] = (),
     ) -> None:
-        """Store an answer in L1 RAM with optional TTL and categorization tags."""
+        """Store an answer on the desk (L1) with optional expiration timer and tags."""
         with self._lock:
-            # Calculate expiration timestamp
             effective_ttl = ttl if ttl is not None else self.config.default_ttl
             expires_at = (time.time() + effective_ttl) if (effective_ttl is not None and effective_ttl > 0) else None
 
-            # Update tag index
             self._update_tags(key, tags)
 
-            # If key was already in L2, remove it so it only lives in L1 (strict tiering)
+            # Strict single copy: if it was in the cabinet, remove it so it's only on the desk
             if key in self.l2:
                 self.l2.remove(key)
 
             evicted = self.l1.put(key, value, vector, expires_at=expires_at, tags=tags)
 
-            # If an item was pushed off the desk, save it safely in the filing cabinet
+            # If an item slid off the desk, save it safely in the filing cabinet
             if evicted is not None:
                 self._evictions += 1
                 self.l2.append(
@@ -185,7 +213,7 @@ class StorageManager:
                 )
 
     def _update_tags(self, key: str, tags: Sequence[str]) -> None:
-        """Update tag indices for a given key."""
+        """Keep tag index up-to-date for fast group invalidation."""
         old_tags = self._key_to_tags.get(key, set())
         for ot in old_tags:
             self._tag_to_keys[ot].discard(key)
@@ -201,7 +229,7 @@ class StorageManager:
             self._key_to_tags.pop(key, None)
 
     def _promote_to_l1(self, record: CacheRecord) -> None:
-        """Move a cold item from L2 Disk back onto the warm L1 RAM desk (strict tiering)."""
+        """Promote a cold item from the filing cabinet back onto the warm desk."""
         self.l2.remove(record.key)
         evicted = self.l1.put(
             record.key,
@@ -221,23 +249,20 @@ class StorageManager:
             )
 
     def expire(self, key: str, ttl_seconds: float) -> bool:
-        """Set a time-to-live on an existing key across L1 or L2 in seconds."""
+        """Set or update an expiration timer on an existing item in seconds."""
         with self._lock:
-            # Try L1
             if key in self.l1:
                 return self.l1.expire(key, ttl_seconds)
-            # Try L2
             if key in self.l2:
                 rec = self.l2.get_exact(key)
                 if rec is not None:
-                    # Append updated record with new TTL
                     new_exp = time.time() + ttl_seconds
                     self.l2.append(rec.key, rec.value, rec.vector, expires_at=new_exp, tags=rec.tags)
                     return True
             return False
 
     def ttl(self, key: str) -> int:
-        """Return remaining TTL for key (-2 if missing, -1 if no TTL, >=0 remaining)."""
+        """Check remaining seconds before an item expires (-2 if missing, -1 if no timer)."""
         with self._lock:
             if key in self.l1:
                 return self.l1.ttl(key)
@@ -248,7 +273,7 @@ class StorageManager:
             return -2
 
     def invalidate_tag(self, tag: str) -> int:
-        """Delete all cached items associated with a given tag in O(tagged_keys)."""
+        """Delete all cached items labeled with a specific tag."""
         with self._lock:
             keys = list(self._tag_to_keys.get(tag, set()))
             count = 0
@@ -258,7 +283,7 @@ class StorageManager:
             return count
 
     def sweep_expired(self) -> int:
-        """Active expiration sweep across both tiers."""
+        """Toss out all expired items across both the desk and the cabinet."""
         with self._lock:
             swept_l1 = self.l1.sweep_expired()
             swept_l2 = self.l2.sweep_expired()
@@ -267,7 +292,7 @@ class StorageManager:
             return total
 
     def delete(self, key: str) -> bool:
-        """Delete an item from L1 and/or L2 in strict O(1) time."""
+        """Delete an answer completely in 1 instant step."""
         with self._lock:
             self._update_tags(key, ())
             del_l1 = self.l1.delete(key)
@@ -275,12 +300,12 @@ class StorageManager:
             return del_l1 or del_l2
 
     def compact(self) -> int:
-        """Compact L2 disk storage by purging deleted, overwritten, and expired records."""
+        """Clean up the filing cabinet file on disk to free up wasted space."""
         with self._lock:
             return self.l2.compact()
 
     def clear(self) -> None:
-        """Clear all cached records in both L1 RAM and L2 Disk."""
+        """Wipe both desk and filing cabinet clean."""
         with self._lock:
             self.l1.clear()
             self.l2.clear()
@@ -288,7 +313,7 @@ class StorageManager:
             self._key_to_tags.clear()
 
     def stats(self) -> dict[str, Any]:
-        """Return system metrics: counts, hits, misses, evictions, and expired purges."""
+        """Return system health metrics: item counts, hits, misses, and evictions."""
         with self._lock:
             return {
                 "l1_count": len(self.l1),
@@ -305,17 +330,17 @@ class StorageManager:
             }
 
     def __len__(self) -> int:
-        """Return total unique items across L1 and L2."""
+        """Total number of unique items across both tiers."""
         with self._lock:
             return len(self.l1) + len(self.l2)
 
     def __contains__(self, key: str) -> bool:
-        """Check membership across L1 and L2 in O(1) time."""
+        """Check if an item exists anywhere in the cache."""
         with self._lock:
             return (key in self.l1) or (key in self.l2)
 
     def close(self) -> None:
-        """Close storage handles cleanly and stop background sweeper."""
+        """Cleanly close files and stop the background cleaner thread."""
         self._stop_sweep.set()
         if self._sweep_thread is not None and self._sweep_thread.is_alive():
             self._sweep_thread.join(timeout=1.0)

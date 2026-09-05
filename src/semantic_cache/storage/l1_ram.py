@@ -1,40 +1,37 @@
 """
-Tiered Semantic Cache - L1 In-Memory RAM Cache (The "Clean Desk")
-================================================================
+Tiered Semantic Cache - L1 In-Memory RAM Cache (The "Fast Office Desk")
+=======================================================================
 
 What is this file?
 ------------------
-This is Tier 1 of our cache: fast computer memory (RAM).
+This is Tier 1 of our cache: lightning-fast computer memory (RAM).
 Think of it like the top of your office desk:
-- You keep the things you use most often right in front of you.
-- Your desk has limited space (ram_capacity).
-- If your desk gets full, the paper you haven't touched for the longest time
-  (Least Recently Used, or LRU) slides off your desk into the filing cabinet (L2 Disk).
+- You keep the answers you need most often right in front of you.
+- Your desk only has room for a certain number of papers (ram_capacity).
+- When the desk is full, the paper you haven't touched for the longest time
+  (Least Recently Used, or LRU) slides off the desk and into the filing cabinet (L2 Disk).
 
-How it stays super fast (Low-Latency Math & Logic in Points):
--------------------------------------------------------------
-1. Strict O(1) Instant Exact Search:
-   - Uses Python's OrderedDict (a hash map + doubly linked list built in C).
-   - Finding any exact text takes 1 quick step (O(1)).
-   - When an item is read, it moves to the top of the stack in 1 step:
-     move_to_end(key, last=True).
+How it stays super fast (The Simple Math & Logic):
+--------------------------------------------------
+1. Instant Exact Search (O(1) Hash Map):
+   - Finding exact text takes 1 instant step using Python's OrderedDict.
+   - When you read a paper, it moves right to the top of your desk so it won't be thrown out.
 
-2. Strict O(1) Eviction:
-   - When the desk is full, popitem(last=False) removes the oldest item
-     from the bottom in exactly 1 step (O(1)).
+2. Instant Eviction (O(1) Swap-and-Pop):
+   - When the desk is full, the oldest paper at the bottom is popped in 1 step.
+   - To remove a sentence's arrow from our table, we swap it with the very last arrow.
+     (Just like taking the bottom card from a deck to fill an empty slot—takes 1 instant step!).
 
-3. Zero-Allocation Semantic Search:
-   - All saved vectors are kept in a contiguous 2D table (matrix).
-   - When removing or evicting an item, we swap its row with the last row
-     in the matrix (slot swap in O(1)).
-   - When searching, we multiply all rows at once using hardware SIMD (BLAS).
-     Zero memory allocations during query time!
+3. Fast Meaning Search (Matrix Dot Product):
+   - All arrows are lined up in a neat table (matrix).
+   - In 1 hardware step, your question's arrow is multiplied against all saved arrows
+     to find the closest meaning.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import time
 from typing import Optional, Sequence, Tuple
 import numpy as np
@@ -42,7 +39,7 @@ import numpy as np
 
 @dataclass
 class CacheRecord:
-    """A single cached item holding text, answer, direction arrow, TTL, and tags."""
+    """A single cached item holding question, answer, direction arrow, TTL, and tags."""
 
     key: str
     value: str
@@ -52,14 +49,14 @@ class CacheRecord:
 
     @property
     def is_expired(self) -> bool:
-        """True if current wall-clock time has passed the expiration timestamp."""
+        """True if the clock has passed the expiration time."""
         if self.expires_at is None or self.expires_at <= 0:
             return False
         return time.time() >= self.expires_at
 
     @property
     def ttl(self) -> int:
-        """Remaining TTL in seconds (-1 if immortal, 0 if expired)."""
+        """Remaining seconds before expiration (-1 means it lives forever, 0 means expired)."""
         if self.expires_at is None or self.expires_at <= 0:
             return -1
         remaining = int(self.expires_at - time.time())
@@ -67,10 +64,10 @@ class CacheRecord:
 
 
 class L1RAMCache:
-    """Strict O(1) LRU in-memory cache with hardware-accelerated vector search."""
+    """Fast in-memory cache with instant LRU eviction and vector search."""
 
     def __init__(self, capacity: int = 1000, dim: int = 384) -> None:
-        """Initialize L1 cache with maximum desk space and arrow dimension."""
+        """Set up desk with maximum item capacity and arrow size."""
         if capacity <= 0:
             raise ValueError(f"Capacity must be > 0, got {capacity}")
         if dim <= 0:
@@ -79,20 +76,20 @@ class L1RAMCache:
         self.capacity = capacity
         self.dim = dim
 
-        # 1. Doubly linked hash map for strict O(1) exact lookup & LRU order
+        # 1. Fast lookup table that also remembers what was used most recently
         self._records: OrderedDict[str, CacheRecord] = OrderedDict()
 
-        # 2. Contiguous 2D matrix for instant BLAS vector search
+        # 2. Neat table of numbers (matrix) for instant arrow math
         self._matrix = np.zeros((capacity, dim), dtype=np.float32)
         self._matrix_keys: list[str] = []
         self._key_to_slot: dict[str, int] = {}
 
     def __len__(self) -> int:
-        """Current number of items on the desk."""
+        """Count how many items are currently on the desk."""
         return len(self._records)
 
     def __contains__(self, key: str) -> bool:
-        """Check if key exists in L1 in O(1) time (evicting if expired)."""
+        """Check if a question is on the desk (removes it if expired)."""
         if key not in self._records:
             return False
         if self._records[key].is_expired:
@@ -101,14 +98,14 @@ class L1RAMCache:
         return True
 
     def is_full(self) -> bool:
-        """True if desk has reached maximum capacity."""
+        """True if the desk has reached its maximum item limit."""
         return len(self._records) >= self.capacity
 
     def get_exact(self, key: str) -> Optional[CacheRecord]:
-        """Look up by exact text in O(1) time.
+        """Look up by exact text in 1 instant step.
 
-        If found and not expired, marks as most recently used.
-        If expired, removes the item passively and returns None.
+        - If found and not expired, moves the item to the top of the desk (most recently used).
+        - If expired, removes it immediately and returns None.
         """
         if key not in self._records:
             return None
@@ -118,7 +115,7 @@ class L1RAMCache:
             self.delete(key)
             return None
 
-        # O(1) move to top of recent list
+        # Move to the top of the pile
         self._records.move_to_end(key, last=True)
         return rec
 
@@ -127,21 +124,25 @@ class L1RAMCache:
         query_vector: np.ndarray,
         threshold: float,
     ) -> Optional[Tuple[CacheRecord, float]]:
-        """Find closest answer in O(N*d) time, skipping and purging expired records."""
+        """Find the closest matching answer by comparing arrow directions.
+
+        Skips and removes any expired items automatically.
+        """
         count = len(self._matrix_keys)
         if count == 0:
             return None
 
+        # Multiply question arrow against all active arrows in 1 instant hardware step
         active_matrix = self._matrix[:count]
         scores = np.dot(active_matrix, query_vector)
 
-        # Sort indices in descending order of score to inspect best candidates
+        # Check candidates from highest score to lowest
         candidate_indices = np.argsort(-scores)
 
         for idx in candidate_indices:
             score = float(scores[idx])
             if score < threshold:
-                break  # Best remaining candidates do not meet threshold
+                break  # The rest are too low to be a match
 
             candidate_key = self._matrix_keys[idx]
             rec = self._records.get(candidate_key)
@@ -152,6 +153,7 @@ class L1RAMCache:
                 self.delete(candidate_key)
                 continue
 
+            # Valid match found! Mark as recently used and return it
             self._records.move_to_end(candidate_key, last=True)
             return rec, score
 
@@ -165,24 +167,24 @@ class L1RAMCache:
         expires_at: Optional[float] = None,
         tags: Sequence[str] = (),
     ) -> Optional[CacheRecord]:
-        """Put a new item on the desk.
+        """Place a new answer on the desk.
 
-        If the desk is full, kicks out the oldest item (LRU) in O(1) time
-        and returns it so it can be saved to disk.
+        If the desk is full, pushes the oldest unused paper off the desk
+        so it can be safely stored in the filing cabinet (L2 Disk).
         """
         evicted: Optional[CacheRecord] = None
 
-        # If key already exists, update it cleanly
+        # If question already exists, update it cleanly
         if key in self._records:
             self._remove_from_matrix(key)
             self._records.pop(key)
         elif self.is_full():
-            # Desk full! Eject the oldest item (front of OrderedDict) in O(1)
+            # Desk full! Push the oldest item off the bottom in 1 instant step
             oldest_key, oldest_record = self._records.popitem(last=False)
             self._remove_from_matrix(oldest_key)
             evicted = oldest_record
 
-        # Store in records with TTL and tags
+        # Save record with expiration time and tags
         rec = CacheRecord(
             key=key,
             value=value,
@@ -192,7 +194,7 @@ class L1RAMCache:
         )
         self._records[key] = rec
 
-        # Store in vector matrix slot in O(1)
+        # Assign arrow to the next open row in our table
         slot = len(self._matrix_keys)
         self._matrix[slot] = vector
         self._matrix_keys.append(key)
@@ -201,7 +203,7 @@ class L1RAMCache:
         return evicted
 
     def expire(self, key: str, ttl_seconds: float) -> bool:
-        """Set a time-to-live expiration on an existing key in seconds."""
+        """Set a countdown timer on an existing answer."""
         if key not in self._records:
             return False
         rec = self._records[key]
@@ -212,7 +214,7 @@ class L1RAMCache:
         return True
 
     def ttl(self, key: str) -> int:
-        """Return remaining TTL in seconds (-2 if missing, -1 if no TTL, >=0 remaining)."""
+        """Check how many seconds are left before an answer expires (-2 if missing, -1 if no timer)."""
         if key not in self._records:
             return -2
         rec = self._records[key]
@@ -222,17 +224,14 @@ class L1RAMCache:
         return rec.ttl
 
     def sweep_expired(self) -> int:
-        """Active expiration: scan and remove expired items from L1 RAM."""
+        """Active cleanup: scan the desk and toss out all expired answers."""
         expired_keys = [k for k, r in self._records.items() if r.is_expired]
         for k in expired_keys:
             self.delete(k)
         return len(expired_keys)
 
     def delete(self, key: str) -> bool:
-        """Remove an item from L1 RAM in strict O(1) time.
-
-        Returns True if item was present and deleted, False otherwise.
-        """
+        """Remove an item from the desk in 1 instant step."""
         if key not in self._records:
             return False
 
@@ -241,19 +240,23 @@ class L1RAMCache:
         return True
 
     def clear(self) -> None:
-        """Clear all records and vector matrices in L1 RAM."""
+        """Wipe the desk clean."""
         self._records.clear()
         self._matrix_keys.clear()
         self._key_to_slot.clear()
         self._matrix.fill(0.0)
 
     def _remove_from_matrix(self, key: str) -> None:
-        """Remove an item's vector using O(1) slot swap (swap with last element)."""
+        """Remove an arrow using the Card-Deck Swap trick (O(1) swap-and-pop).
+
+        Instead of slowly shifting all arrows over to fill the empty hole,
+        we just grab the very last arrow in the table and place it in the empty spot!
+        """
         slot = self._key_to_slot.pop(key)
         last_slot = len(self._matrix_keys) - 1
         last_key = self._matrix_keys.pop()
 
-        # If removed item was not already at the end, swap last item into its slot
+        # If the item wasn't already at the very end, move the last item into this slot
         if slot != last_slot:
             self._matrix[slot] = self._matrix[last_slot]
             self._matrix_keys[slot] = last_key

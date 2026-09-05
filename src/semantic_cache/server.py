@@ -14,19 +14,20 @@ Think of it like a 24/7 drive-thru window:
 
 Supported Commands in Plain English:
 ------------------------------------
-1. PING [message]
-   - Health check. Returns "+PONG" or echoes your text.
-2. SEMANTIC.SET <key> <value>
-   - Turns the key into numbers (arrow), saves it in L1 RAM (and L2 Disk if full),
-     and returns "+OK".
-3. SEMANTIC.GET <key>
-   - Searches for an exact match OR a meaning match (score >= threshold).
-   - If found: returns the cached answer as a Bulk String ($len\\r\\nvalue\\r\\n).
-   - If missed: returns standard Redis Null ($-1\\r\\n).
-4. STATS
-   - Returns cache health, item counts, hits, misses, and evictions.
-5. QUIT
-   - Politely closes the connection.
+1. PING [message]                -> Health check ("+PONG").
+2. SEMANTIC.SET <key> <val>      -> Saves question & answer across RAM/Disk ("+OK").
+3. SEMANTIC.SETEX <k> <sec> <v>  -> Saves with an expiration countdown in seconds.
+4. SEMANTIC.GET <key>            -> Searches for exact text OR close meaning match.
+5. EXPIRE <key> <seconds>        -> Sets or updates an expiration timer on a saved item.
+6. TTL <key>                     -> Returns remaining seconds before expiration.
+7. DEL <key>                     -> Deletes an item from both RAM and Disk.
+8. TAG.INVALIDATE <tag>          -> Deletes all items associated with a given tag.
+9. EXISTS <key>                  -> Checks if an item exists (1 if yes, 0 if no).
+10. DBSIZE                       -> Returns total count of all cached items.
+11. STATS                        -> Returns health metrics (hits, misses, counts) as JSON.
+12. COMPACT                      -> Cleans up dead space on disk to reclaim storage.
+13. FLUSHDB / FLUSHALL           -> Wipes the entire cache clean.
+14. QUIT                         -> Closes the client connection.
 """
 
 from __future__ import annotations

@@ -1,17 +1,25 @@
 """
-Tiered Semantic Cache - High-Performance Python Client SDK
-==========================================================
+Tiered Semantic Cache - Python Client SDK (The "Remote Control")
+================================================================
 
 What is this file?
 ------------------
-This file provides `SemanticCacheClient`, a production-grade Python client
-for communicating with the standalone Semantic Cache TCP server daemon.
+This file provides `SemanticCacheClient`, a Python remote control for talking
+to the Semantic Cache server over the network.
 
-Features:
-- Speaks native RESP protocol over streaming TCP sockets.
-- Automatic reconnect on transient socket drops.
-- Optional in-process fallback cache if the remote TCP server is unreachable.
-- Sub-millisecond latency with standard Redis commands.
+Key Features for Everyone:
+--------------------------
+1. Standard Redis Wire Language (RESP):
+   - Speaks standard Redis protocol over fast TCP connections.
+   - Compatible with local servers or remote VPS cloud instances.
+
+2. Crash-Proof In-Process Fallback:
+   - If your server or VPS ever goes offline, the client can automatically
+     fall back to a local in-memory cache on your computer.
+   - Your website or chatbot will NEVER crash!
+
+3. Microsecond Speed:
+   - Reuses open socket connections and uses zero-delay TCP buffering (TCP_NODELAY).
 """
 
 from __future__ import annotations
@@ -25,7 +33,7 @@ from semantic_cache.protocol import RESPParser, RESPSerializer
 
 
 class SemanticCacheClient:
-    """Client for querying the Semantic Cache TCP server daemon over network."""
+    """Client for connecting to the Semantic Cache server over the network."""
 
     def __init__(
         self,
@@ -34,13 +42,13 @@ class SemanticCacheClient:
         timeout: float = 3.0,
         fallback_cache: Any = None,
     ) -> None:
-        """Initialize client connection configuration.
+        """Set up client connection settings.
 
         Args:
-            host: Target cache server hostname/IP.
-            port: Target cache server TCP port.
-            timeout: Socket timeout in seconds.
-            fallback_cache: Optional in-process TieredSemanticCache to fallback to if server is unreachable.
+            host: Server address (default '127.0.0.1' = this computer).
+            port: Server door number (default 6380).
+            timeout: How many seconds to wait for a response before timing out.
+            fallback_cache: Local cache to use automatically if the server is offline.
         """
         self.host = host
         self.port = port
@@ -50,7 +58,7 @@ class SemanticCacheClient:
         self._file: Optional[Any] = None
 
     def _connect(self) -> None:
-        """Establish or verify socket connection."""
+        """Open or check the network connection."""
         if self._sock is not None:
             return
         try:
@@ -63,7 +71,7 @@ class SemanticCacheClient:
             raise
 
     def _disconnect(self) -> None:
-        """Safely close active socket."""
+        """Safely close the connection."""
         if self._file:
             try:
                 self._file.close()
@@ -78,12 +86,12 @@ class SemanticCacheClient:
             self._sock = None
 
     def _send_command(self, *args: str) -> Any:
-        """Send a RESP array command and read the response."""
+        """Send a command to the server and read back the answer."""
         try:
             self._connect()
             assert self._file is not None
 
-            # Encode as standard RESP Array
+            # Package command into standard Redis bytes
             items = [arg.encode("utf-8") for arg in args]
             payload = f"*{len(items)}\r\n".encode("utf-8")
             for it in items:
@@ -92,7 +100,7 @@ class SemanticCacheClient:
             self._file.write(payload)
             self._file.flush()
 
-            # Read RESP response header
+            # Read the response
             line = self._file.readline()
             if not line:
                 raise ConnectionResetError("Server closed connection")
@@ -117,17 +125,17 @@ class SemanticCacheClient:
                 length = int(content)
                 if length == -1:
                     return None  # Cache Miss!
-                data = self._file.read(length + 2)  # payload + \r\n
+                data = self._file.read(length + 2)
                 return data[:-2].decode("utf-8")
 
-            raise ValueError(f"Unexpected RESP response: {line!r}")
+            raise ValueError(f"Unexpected response from server: {line!r}")
 
         except Exception:
             self._disconnect()
             raise
 
     def ping(self, message: Optional[str] = None) -> str:
-        """Check server health."""
+        """Check if the server is alive and responding."""
         try:
             if message:
                 return str(self._send_command("PING", message))
@@ -138,7 +146,7 @@ class SemanticCacheClient:
             raise
 
     def get(self, query: str) -> Optional[str]:
-        """Retrieve answer for query (exact or semantic fuzzy match)."""
+        """Ask for a cached answer (checks both exact text and similar meanings)."""
         try:
             res = self._send_command("SEMANTIC.GET", query)
             return res
@@ -154,7 +162,7 @@ class SemanticCacheClient:
         answer: str,
         ttl: Optional[int] = None,
     ) -> bool:
-        """Store answer with optional TTL in seconds."""
+        """Save a question and answer with an optional countdown timer (TTL)."""
         try:
             if ttl is not None and ttl > 0:
                 res = self._send_command("SEMANTIC.SETEX", query, str(ttl), answer)
@@ -168,7 +176,7 @@ class SemanticCacheClient:
             raise
 
     def delete(self, query: str) -> bool:
-        """Delete query from cache."""
+        """Delete an answer from the cache."""
         try:
             res = self._send_command("DEL", query)
             return bool(res == 1)
@@ -178,7 +186,7 @@ class SemanticCacheClient:
             raise
 
     def expire(self, query: str, seconds: float) -> bool:
-        """Set or update TTL on key."""
+        """Set or update an expiration countdown timer on a saved answer."""
         try:
             res = self._send_command("EXPIRE", query, str(seconds))
             return bool(res == 1)
@@ -188,7 +196,7 @@ class SemanticCacheClient:
             raise
 
     def ttl(self, query: str) -> int:
-        """Return remaining TTL seconds (-2 if missing, -1 if no TTL, >=0 remaining)."""
+        """Check remaining seconds before an answer expires (-2 if missing, -1 if no timer)."""
         try:
             return int(self._send_command("TTL", query))
         except Exception:
@@ -197,7 +205,7 @@ class SemanticCacheClient:
             raise
 
     def dbsize(self) -> int:
-        """Return total count of cached items."""
+        """Check total number of answers saved in the cache."""
         try:
             return int(self._send_command("DBSIZE"))
         except Exception:
@@ -206,7 +214,7 @@ class SemanticCacheClient:
             raise
 
     def invalidate_tag(self, tag: str) -> int:
-        """Invalidate all items belonging to a tag."""
+        """Delete all answers labeled with a given tag."""
         try:
             return int(self._send_command("TAG.INVALIDATE", tag))
         except Exception:
@@ -215,7 +223,7 @@ class SemanticCacheClient:
             raise
 
     def stats(self) -> Dict[str, Any]:
-        """Fetch server operational statistics as a dictionary."""
+        """Fetch server operational statistics (hits, misses, item counts)."""
         try:
             raw_json = self._send_command("STATS")
             return json.loads(raw_json)
@@ -225,7 +233,7 @@ class SemanticCacheClient:
             raise
 
     def compact(self) -> int:
-        """Trigger disk log compaction and return reclaimed bytes."""
+        """Clean up disk file on server to reclaim wasted storage space."""
         try:
             return int(self._send_command("COMPACT"))
         except Exception:
@@ -234,7 +242,7 @@ class SemanticCacheClient:
             raise
 
     def flushdb(self) -> bool:
-        """Clear cache completely."""
+        """Wipe the entire cache clean."""
         try:
             res = self._send_command("FLUSHDB")
             return res == "OK"
@@ -245,7 +253,7 @@ class SemanticCacheClient:
             raise
 
     def close(self) -> None:
-        """Close connection."""
+        """Close the network connection."""
         self._disconnect()
 
     def __enter__(self) -> SemanticCacheClient:
