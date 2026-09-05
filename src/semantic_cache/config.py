@@ -54,6 +54,9 @@ class CacheConfig:
     vector_dim: int = 384
     port: int = 6380
     host: str = "127.0.0.1"
+    default_ttl: Optional[int] = None
+    enable_active_sweep: bool = True
+    sweep_interval_sec: float = 30.0
 
     def __post_init__(self) -> None:
         """Simple checks to catch any mistake before starting the cache."""
@@ -81,6 +84,18 @@ class CacheConfig:
         if type(self.port) is not int or not (1 <= self.port <= 65535):
             raise ValueError(
                 f"port must be a valid network port between 1 and 65535, got {self.port}"
+            )
+
+        # 5. Check default_ttl if provided
+        if self.default_ttl is not None and (
+            type(self.default_ttl) is not int or self.default_ttl <= 0
+        ):
+            raise ValueError(f"default_ttl must be a positive integer, got {self.default_ttl}")
+
+        # 6. Check sweep interval
+        if not isinstance(self.sweep_interval_sec, (int, float)) or self.sweep_interval_sec <= 0:
+            raise ValueError(
+                f"sweep_interval_sec must be positive, got {self.sweep_interval_sec}"
             )
 
         # 5. Convert text file path to a proper Path object

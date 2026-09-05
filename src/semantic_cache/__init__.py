@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from semantic_cache.client import SemanticCacheClient
 from semantic_cache.config import CacheConfig
 from semantic_cache.embedder import BaseEmbedder, DenseHashEmbedder
 from semantic_cache.storage.l1_ram import CacheRecord
@@ -78,8 +79,14 @@ class TieredSemanticCache:
 
         return self.storage.get(query, embed_fn=self.embedder.embed)
 
-    def set(self, query: str, answer: str) -> None:
-        """Store a question and answer pair.
+    def set(
+        self,
+        query: str,
+        answer: str,
+        ttl: Optional[int] = None,
+        tags: Sequence[str] = (),
+    ) -> None:
+        """Store a question and answer pair with optional TTL and tags.
 
         Computes the dense vector embedding and inserts into L1 RAM.
         If L1 capacity is exceeded, automatically spills the least-recently used
@@ -88,6 +95,8 @@ class TieredSemanticCache:
         Args:
             query: The query string to index.
             answer: The value/answer string to cache.
+            ttl: Optional time-to-live in seconds (None uses config default or immortal).
+            tags: Optional categorization tags for group invalidation.
         """
         if not query or not isinstance(query, str) or not query.strip():
             raise ValueError("Query must be a non-empty string.")
@@ -95,7 +104,35 @@ class TieredSemanticCache:
             raise ValueError("Answer must be a string.")
 
         vector = self.embedder.embed(query)
-        self.storage.set(key=query, value=answer, vector=vector)
+        self.storage.set(key=query, value=answer, vector=vector, ttl=ttl, tags=tags)
+
+    def expire(self, query: str, ttl_seconds: float) -> bool:
+        """Set or update TTL expiration in seconds on an existing cached query."""
+        if not query or not isinstance(query, str):
+            return False
+        return self.storage.expire(query, ttl_seconds)
+
+    def ttl(self, query: str) -> int:
+        """Return remaining TTL in seconds (-2 if missing, -1 if no expiry, >=0 remaining)."""
+        if not query or not isinstance(query, str):
+            return -2
+        return self.storage.ttl(query)
+
+    def invalidate_tag(self, tag: str) -> int:
+        """Invalidate and purge all cached answers associated with a tag.
+
+        Returns:
+            Number of records purged.
+        """
+        if not tag or not isinstance(tag, str):
+            return 0
+        return self.storage.invalidate_tag(tag)
+
+    def namespace(self, name: str) -> NamespacedSemanticCache:
+        """Create an isolated, multi-tenant sub-view of the cache."""
+        if not name or not isinstance(name, str):
+            raise ValueError("Namespace must be a non-empty string.")
+        return NamespacedSemanticCache(self, name)
 
     def delete(self, query: str) -> bool:
         """Delete an item from L1 and/or L2 in strict O(1) time.
@@ -173,8 +210,88 @@ class TieredSemanticCache:
         )
 
 
+class NamespacedSemanticCache:
+    """Isolated multi-tenant view of the cache scoped by a namespace prefix."""
+
+    def __init__(self, cache: TieredSemanticCache, namespace: str) -> None:
+        self._cache = cache
+        self.namespace = namespace.strip(":")
+
+    def _prefix_key(self, key: str) -> str:
+        return f"{self.namespace}:{key}"
+
+    def get(self, query: str) -> Optional[LookupResult]:
+        """Retrieve answer within this namespace scope, ensuring strict cross-tenant isolation."""
+        res = self._cache.get(self._prefix_key(query))
+        if res is None:
+            return None
+
+        prefix = f"{self.namespace}:"
+        # Ensure semantic match belongs to this namespace
+        if not res.matched_key.startswith(prefix):
+            return None
+
+        clean_key = res.matched_key[len(prefix):]
+        return LookupResult(
+            value=res.value,
+            similarity=res.similarity,
+            matched_key=clean_key,
+            tier=res.tier,
+            ttl=res.ttl,
+            tags=res.tags,
+        )
+
+    def set(
+        self,
+        query: str,
+        answer: str,
+        ttl: Optional[int] = None,
+        tags: Sequence[str] = (),
+    ) -> None:
+        """Store an answer within this namespace scope."""
+        ns_tags = [f"{self.namespace}:{t}" for t in tags]
+        self._cache.set(self._prefix_key(query), answer, ttl=ttl, tags=ns_tags)
+
+    def delete(self, query: str) -> bool:
+        """Delete query from this namespace scope."""
+        return self._cache.delete(self._prefix_key(query))
+
+    def expire(self, query: str, ttl_seconds: float) -> bool:
+        """Update TTL for a query within this namespace."""
+        return self._cache.expire(self._prefix_key(query), ttl_seconds)
+
+    def ttl(self, query: str) -> int:
+        """Return remaining TTL for a query within this namespace."""
+        return self._cache.ttl(self._prefix_key(query))
+
+    def invalidate_tag(self, tag: str) -> int:
+        """Invalidate all items with tag within this namespace."""
+        return self._cache.invalidate_tag(f"{self.namespace}:{tag}")
+
+    def __contains__(self, query: str) -> bool:
+        return self._prefix_key(query) in self._cache
+
+    def __getitem__(self, query: str) -> str:
+        res = self.get(query)
+        if res is None:
+            raise KeyError(query)
+        return res.value
+
+    def __setitem__(self, query: str, answer: str) -> None:
+        self.set(query, answer)
+
+    def __delitem__(self, query: str) -> None:
+        if not self.delete(query):
+            raise KeyError(query)
+
+    def __repr__(self) -> str:
+        return f"<NamespacedSemanticCache namespace='{self.namespace}'>"
+
+
 __all__ = [
     "TieredSemanticCache",
+    "NamespacedSemanticCache",
+    "SemanticCacheClient",
     "CacheConfig",
     "LookupResult",
     "CacheRecord",

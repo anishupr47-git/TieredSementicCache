@@ -137,12 +137,45 @@ class SemanticCacheServer:
             key = args[1]
             val = args[2]
 
-            # Vectorize text into normalized direction arrow
             vector = self.embedder.embed(key)
             self.storage.set(key, val, vector)
             return RESPSerializer.ok()
 
-        # 3. Retrieve: SEMANTIC.GET <key> (fast path bypasses vector embedding on exact match)
+        # 3. Store with TTL: SETEX <key> <seconds> <value>
+        if cmd in ("SEMANTIC.SETEX", "SETEX"):
+            if len(args) < 4:
+                return RESPSerializer.error(f"wrong number of arguments for '{cmd}'")
+            key = args[1]
+            try:
+                seconds = int(args[2])
+            except ValueError:
+                return RESPSerializer.error("value is not an integer or out of range")
+            val = args[3]
+
+            vector = self.embedder.embed(key)
+            self.storage.set(key, val, vector, ttl=seconds)
+            return RESPSerializer.ok()
+
+        # 4. Set TTL on existing key: EXPIRE <key> <seconds>
+        if cmd == "EXPIRE":
+            if len(args) < 3:
+                return RESPSerializer.error(f"wrong number of arguments for '{cmd}'")
+            key = args[1]
+            try:
+                seconds = float(args[2])
+            except ValueError:
+                return RESPSerializer.error("value is not a valid number")
+            success = self.storage.expire(key, seconds)
+            return RESPSerializer.integer(1 if success else 0)
+
+        # 5. Check TTL: TTL <key>
+        if cmd == "TTL":
+            if len(args) < 2:
+                return RESPSerializer.error(f"wrong number of arguments for '{cmd}'")
+            remaining = self.storage.ttl(args[1])
+            return RESPSerializer.integer(remaining)
+
+        # 6. Retrieve: SEMANTIC.GET <key> (fast path bypasses vector embedding on exact match)
         if cmd in ("SEMANTIC.GET", "GET"):
             if len(args) < 2:
                 return RESPSerializer.error(f"wrong number of arguments for '{cmd}'")
@@ -155,41 +188,48 @@ class SemanticCacheServer:
                 return RESPSerializer.bulk_string(None)  # $-1\r\n = Cache Miss!
             return RESPSerializer.bulk_string(result.value)
 
-        # 4. Invalidate / Delete: DEL <key> or SEMANTIC.DEL <key>
+        # 7. Invalidate / Delete: DEL <key> or SEMANTIC.DEL <key>
         if cmd in ("SEMANTIC.DEL", "DEL"):
             if len(args) < 2:
                 return RESPSerializer.error(f"wrong number of arguments for '{cmd}'")
             deleted = self.storage.delete(args[1])
             return RESPSerializer.integer(1 if deleted else 0)
 
-        # 5. Existence check: EXISTS <key>
+        # 8. Tag Invalidation: TAG.INVALIDATE <tag>
+        if cmd == "TAG.INVALIDATE":
+            if len(args) < 2:
+                return RESPSerializer.error(f"wrong number of arguments for '{cmd}'")
+            count = self.storage.invalidate_tag(args[1])
+            return RESPSerializer.integer(count)
+
+        # 9. Existence check: EXISTS <key>
         if cmd == "EXISTS":
             if len(args) < 2:
                 return RESPSerializer.error(f"wrong number of arguments for '{cmd}'")
             exists = args[1] in self.storage
             return RESPSerializer.integer(1 if exists else 0)
 
-        # 6. Database size: DBSIZE
+        # 10. Database size: DBSIZE
         if cmd == "DBSIZE":
             return RESPSerializer.integer(len(self.storage))
 
-        # 7. Metrics: STATS
+        # 11. Metrics: STATS
         if cmd == "STATS":
             stats_dict = self.storage.stats()
             stats_json = json.dumps(stats_dict, indent=2)
             return RESPSerializer.bulk_string(stats_json)
 
-        # 8. Compact L2 disk storage: COMPACT
+        # 12. Compact L2 disk storage: COMPACT
         if cmd == "COMPACT":
             reclaimed = self.storage.compact()
             return RESPSerializer.integer(reclaimed)
 
-        # 9. Clear cache: FLUSHDB / FLUSHALL
+        # 13. Clear cache: FLUSHDB / FLUSHALL
         if cmd in ("FLUSHDB", "FLUSHALL"):
             self.storage.clear()
             return RESPSerializer.ok()
 
-        # 10. Quit: QUIT
+        # 14. Quit: QUIT
         if cmd == "QUIT":
             return RESPSerializer.ok()
 

@@ -39,17 +39,20 @@ from __future__ import annotations
 import mmap
 from pathlib import Path
 import struct
-from typing import Optional, Tuple
+import time
+from typing import Optional, Sequence, Tuple
 import numpy as np
 
 from semantic_cache.storage.l1_ram import CacheRecord
 
-HEADER_FORMAT = "<III"  # 3 unsigned 32-bit integers = 12 bytes
+# Binary Record Header Format:
+# klen(u32), vlen(u32), dim(u32), expires_at_ms(u64), tag_len(u32) = 24 bytes
+HEADER_FORMAT = "<IIIQI"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 
 class L2DiskCache:
-    """Zero-copy memory-mapped (mmap) append-only disk storage."""
+    """Zero-copy memory-mapped (mmap) append-only disk storage with TTL and Tagging."""
 
     def __init__(self, file_path: Path, dim: int = 384) -> None:
         """Initialize disk cache at the specified file path."""
@@ -80,8 +83,11 @@ class L2DiskCache:
         return self._count
 
     def __contains__(self, key: str) -> bool:
-        """Check if key exists in L2 index in O(1) time."""
-        return key in self._index
+        """Check if key exists in L2 index in O(1) time (purging if expired)."""
+        if key not in self._index:
+            return False
+        rec = self.get_exact(key)
+        return rec is not None
 
     def _build_index(self) -> None:
         """Scan the disk log once at startup to index all saved items, deduplicating superseded entries."""
@@ -98,18 +104,23 @@ class L2DiskCache:
         deduped: dict[str, Tuple[int, int, np.ndarray]] = {}
 
         while offset + HEADER_SIZE <= size:
-            klen, vlen, dim = struct.unpack_from(HEADER_FORMAT, self._mm, offset)
-            record_len = HEADER_SIZE + klen + vlen + (dim * 4)
+            klen, vlen, dim, exp_ms, tag_len = struct.unpack_from(HEADER_FORMAT, self._mm, offset)
+            record_len = HEADER_SIZE + klen + vlen + tag_len + (dim * 4)
 
             if offset + record_len > size:
                 break  # Incomplete record at end of file
+
+            # Check expiration on reload
+            if exp_ms > 0 and (time.time() * 1000.0) >= exp_ms:
+                offset += record_len
+                continue
 
             # Read key text
             key_bytes = self._mm[offset + HEADER_SIZE : offset + HEADER_SIZE + klen]
             key = key_bytes.decode("utf-8")
 
             # Read vector arrow
-            vec_offset = offset + HEADER_SIZE + klen + vlen
+            vec_offset = offset + HEADER_SIZE + klen + vlen + tag_len
             vec = np.frombuffer(self._mm, dtype=np.float32, count=dim, offset=vec_offset).copy()
 
             # The latest record in the log supersedes older records for the same key
@@ -128,7 +139,10 @@ class L2DiskCache:
                 self._matrix[slot] = vec
 
     def get_exact(self, key: str) -> Optional[CacheRecord]:
-        """Read a record from disk in strict O(1) time using zero-copy mmap."""
+        """Read a record from disk in strict O(1) time using zero-copy mmap.
+
+        Passively evicts and returns None if expired.
+        """
         if key not in self._index:
             return None
 
@@ -139,17 +153,31 @@ class L2DiskCache:
             self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
 
         offset, _ = self._index[key]
-        klen, vlen, dim = struct.unpack_from(HEADER_FORMAT, self._mm, offset)
+        klen, vlen, dim, exp_ms, tag_len = struct.unpack_from(HEADER_FORMAT, self._mm, offset)
 
-        # Read value string and vector directly from mmap
+        expires_at = (exp_ms / 1000.0) if exp_ms > 0 else None
+        if expires_at is not None and time.time() >= expires_at:
+            self.remove(key)
+            return None
+
+        # Read value string, tags, and vector directly from mmap
         val_start = offset + HEADER_SIZE + klen
-        val_bytes = self._mm[val_start : val_start + vlen]
-        val = val_bytes.decode("utf-8")
+        val = self._mm[val_start : val_start + vlen].decode("utf-8")
 
-        vec_start = val_start + vlen
+        tag_start = val_start + vlen
+        tag_str = self._mm[tag_start : tag_start + tag_len].decode("utf-8")
+        tags = tuple(tag_str.split(",")) if tag_len > 0 else ()
+
+        vec_start = tag_start + tag_len
         vec = np.frombuffer(self._mm, dtype=np.float32, count=dim, offset=vec_start).copy()
 
-        return CacheRecord(key=key, value=val, vector=vec)
+        return CacheRecord(
+            key=key,
+            value=val,
+            vector=vec,
+            expires_at=expires_at,
+            tags=tags,
+        )
 
     def find_semantic(
         self,
@@ -164,29 +192,42 @@ class L2DiskCache:
         active_matrix = self._matrix[: self._count]
         scores = np.dot(active_matrix, query_vector)
 
-        best_idx = int(np.argmax(scores))
-        best_score = float(scores[best_idx])
+        candidate_indices = np.argsort(-scores)
 
-        if best_score >= threshold:
-            best_key = self._keys_list[best_idx]
+        for idx in candidate_indices:
+            score = float(scores[idx])
+            if score < threshold:
+                break
+
+            best_key = self._keys_list[idx]
             record = self.get_exact(best_key)
             if record is not None:
-                return record, best_score
+                return record, score
 
         return None
 
-    def append(self, key: str, value: str, vector: np.ndarray) -> None:
+    def append(
+        self,
+        key: str,
+        value: str,
+        vector: np.ndarray,
+        expires_at: Optional[float] = None,
+        tags: Sequence[str] = (),
+    ) -> None:
         """Append a record to the persistent binary log in amortized O(1) time."""
         key_bytes = key.encode("utf-8")
         val_bytes = value.encode("utf-8")
+        tag_bytes = ",".join(tags).encode("utf-8") if tags else b""
         vec_bytes = vector.astype(np.float32).tobytes()
 
         klen = len(key_bytes)
         vlen = len(val_bytes)
+        tag_len = len(tag_bytes)
         dim = len(vector)
+        exp_ms = int(expires_at * 1000.0) if expires_at is not None and expires_at > 0 else 0
 
-        header = struct.pack(HEADER_FORMAT, klen, vlen, dim)
-        payload = header + key_bytes + val_bytes + vec_bytes
+        header = struct.pack(HEADER_FORMAT, klen, vlen, dim, exp_ms, tag_len)
+        payload = header + key_bytes + val_bytes + tag_bytes + vec_bytes
         total_len = len(payload)
 
         # Close existing mmap before file write (critical for Windows OS file-locking safety)
@@ -223,6 +264,16 @@ class L2DiskCache:
             self._key_to_slot[key] = slot
             self._index[key] = (offset, total_len)
             self._count += 1
+
+    def sweep_expired(self) -> int:
+        """Scan active keys in L2 and remove expired items."""
+        keys_to_check = list(self._index.keys())
+        swept = 0
+        for k in keys_to_check:
+            # get_exact automatically evicts expired records
+            if self.get_exact(k) is None and k not in self._index:
+                swept += 1
+        return swept
 
     def remove(self, key: str) -> bool:
         """Remove an item from L2 in-memory index and vector matrix in strict O(1) time.
